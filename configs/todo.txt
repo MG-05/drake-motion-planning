@@ -1,0 +1,5 @@
+Purpose of planners folder: parameters for each planner we decided to use (step size, max iterations, etc.)
+Need to add:
+1. rrt.yaml -> rrt specific parameters
+2. prm.yaml -> prm specific parameters
+3. vomp.yaml -> vomp specific parameters

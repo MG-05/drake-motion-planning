@@ -1,0 +1,5 @@
+Purpose of src/manipulation folder: convert move object from point A to B to an actual motion planning problem
+Need to add:
+1. task.py -> defines what to pick up
+2. pipeline.py -> defines stages/operations
+3. ik.py -> defines the low-level joint motion

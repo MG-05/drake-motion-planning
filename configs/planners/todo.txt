@@ -1,0 +1,4 @@
+Purpose of configs/planners folder: All the settings of what to run
+Need to add:
+1. scene.yaml -> positions of shelf, object maniuplated, robot, etc.
+2. Anything else that determines config on init

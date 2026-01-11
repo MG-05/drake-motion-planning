@@ -1,0 +1,5 @@
+Purpose of src/sim folder: Build and run Drake sim. enviorment
+Need to add:
+1. build_scene.py -> builds plant from configs/scene.yaml
+2. visualize.py -> does Meshcat setup and eventually draw trajectory
+3. run_simulation.py -> runs sim

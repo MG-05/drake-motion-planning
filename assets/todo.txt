@@ -1,0 +1,5 @@
+Purpose of assets folder: All non-code files to build the scene.
+Need to add:
+1. shelf.urdf
+2. object_manipulated.urdf
+3. Any other custom enviorment geometry

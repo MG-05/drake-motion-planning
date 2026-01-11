@@ -1,0 +1,5 @@
+Purpose of src/planning folder: Motion planning algos + collision checkers + path smoother/QP/Corridor smoothing
+Need to add:
+1. rrt.py
+2. prm.py
+3. vomp.py
