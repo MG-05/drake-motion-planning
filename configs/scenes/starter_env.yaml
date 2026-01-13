@@ -1,0 +1,87 @@
+StarterEnv:
+#  Adapted from RussTedrake's example: https://github.com/RobotLocomotion/drake/issues/20052
+  directives:
+    # -------------------------
+    # Shelves
+    # -------------------------
+    - add_model:
+        name: shelves
+        file: package://drake_models/manipulation_station/shelves.sdf
+
+    # Location of shelf
+    - add_frame:
+        name: shelves_in_world
+        X_PF:
+          base_frame: world
+          translation: [0.0, 0.2, 0.3995]
+          rotation: !Rpy { deg: [0, 0, -90] }
+
+    - add_weld:
+        parent: shelves_in_world
+        child: shelves::shelves_body
+
+    # -------------------------
+    # Robot (KUKA iiwa currently)
+    # -------------------------
+    - add_model:
+        name: iiwa
+        file: package://drake_models/iiwa_description/urdf/iiwa14_primitive_collision.urdf
+        default_joint_positions:
+          iiwa_joint_1: [-0.2]
+          iiwa_joint_2: [0.79]
+          iiwa_joint_3: [0.32]
+          iiwa_joint_4: [-1.76]
+          iiwa_joint_5: [-0.36]
+          iiwa_joint_6: [0.64]
+          iiwa_joint_7: [-0.73]
+
+    - add_frame:
+        name: iiwa_on_world
+        X_PF:
+          base_frame: world
+          translation: [0.0, -0.7, 0.0]
+          rotation: !Rpy { deg: [0, 0, 90] }
+
+    - add_weld:
+        parent: iiwa_on_world
+        child: iiwa::base
+
+    # -------------------------
+    # Gripper
+    # -------------------------
+    - add_model:
+        name: wsg
+        file: package://drake_models/wsg_50_description/sdf/schunk_wsg_50_with_tip.sdf
+        default_joint_positions:
+          left_finger_sliding_joint: [ 0.001 ]
+          right_finger_sliding_joint: [ -0.001 ]
+
+    - add_frame:
+        name: wsg_on_iiwa
+        X_PF:
+          base_frame: iiwa_link_7
+          translation: [0, 0, 0.114]
+          rotation: !Rpy { deg: [90, 0, 90] }
+
+    - add_weld:
+        parent: wsg_on_iiwa
+        child: wsg::body
+
+    # -------------------------
+    # Object (foam brick)
+    # -------------------------
+    - add_model:
+        name: foam_brick
+        file: package://drake_models/manipulation_station/061_foam_brick.sdf
+        default_free_body_pose:
+          base_link:
+            # Place the brick above the shelves without penetrating
+            base_frame: shelves::shelves_body
+            translation: [0.05, 0.0, 0.20]
+            rotation: !Rpy { deg: [0, 0, 0] }
+
+# Make robot and driver rigid
+  model_drivers:
+    iiwa: !IiwaDriver
+      hand_model_name: wsg
+    wsg: !SchunkWsgDriver {}
