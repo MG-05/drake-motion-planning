@@ -23,7 +23,13 @@ from pydrake.multibody.plant import AddMultibodyPlant, MultibodyPlantConfig
 from pydrake.systems.analysis import ApplySimulatorConfig, Simulator, SimulatorConfig
 from pydrake.systems.framework import DiagramBuilder
 from pydrake.systems.lcm import ApplyLcmBusConfig
+from pydrake.trajectories import PiecewisePolynomial
 from pydrake.visualization import ApplyVisualizationConfig, VisualizationConfig
+from pydrake.math import RigidTransform, RollPitchYaw
+
+from src.planning.IK import solve_iiwa_ik_for_gripper_pose
+from src.planning.collision import is_collision_free
+from src.planning.rrt import rrt_plan
 
 
 @dc.dataclass
@@ -140,6 +146,110 @@ def main():
     simulator = Simulator(diagram)
     ApplySimulatorConfig(scenario.simulator_config, simulator)
     simulator.Initialize()
+
+    root_context = simulator.get_mutable_context()
+    plant_context = sim_plant.GetMyMutableContextFromRoot(root_context)
+
+    iiwa = sim_plant.GetModelInstanceByName("iiwa")
+
+    # Start Config
+    q_start = sim_plant.GetPositions(plant_context, iiwa).copy()
+
+    # Forward Kinematics for Goal Config
+    # q_goal = q_start.copy()
+    # q_goal[0] = q_goal[0] + 1.8
+    # q_goal[1] = q_goal[1] - 0.4
+    # q_goal[2] = q_goal[2] - 1.4
+
+    # Inverse Kinematics for Goal Config
+    wsg = sim_plant.GetModelInstanceByName("wsg")
+    # xyz
+    # top shelf = np.array([-0.1, -0.05, 0.63])
+    # middle shelf = np.array([-0.1, -0.05, 0.39])
+    # bottom shelf = np.array([-0.1, -0.05, 0.10])
+    # outside = np.array([-0.30, -0.06, 0.44])
+    end_effector_pos_desired = np.array([-0.1, -0.05, 0.10])
+    # roll pitch yaw
+    end_effector_rot_desired = RollPitchYaw(0.0, np.pi/4, 0.0).ToRotationMatrix()
+    # Transform Matrix
+    transform_desired = RigidTransform(end_effector_rot_desired, end_effector_pos_desired)
+
+    q_goal = solve_iiwa_ik_for_gripper_pose(
+        plant=sim_plant,
+        plant_context_current=plant_context,
+        iiwa_instance=iiwa,
+        wsg_instance=wsg,
+        desired_end_effector=transform_desired,
+        q_iiwa_seed=q_start,
+        position_tol=0.05,
+        theta_tol=0.05,
+    )
+
+    # Determine Joint Limits for iiwa
+    joint_names = [f"iiwa_joint_{i}" for i in range(1, 8)]
+    joints_lower_limits = []
+    joints_upper_limits = []
+
+    for name in joint_names:
+        joint = sim_plant.GetJointByName(name, iiwa)
+        joints_lower_limits.append(joint.position_lower_limits()[0])
+        joints_upper_limits.append(joint.position_upper_limits()[0])
+
+    joints_lower_limits = np.asarray(joints_lower_limits)
+    joints_upper_limits = np.asarray(joints_upper_limits)
+
+    # Do an inital check for collisions for the start and final configs
+    is_free = is_collision_free(diagram, sim_plant, scene_graph, root_context, iiwa)
+
+    print(f"Is the start config collision free? {is_free(q_start)}")
+    print(f"Is the goal config collision free? {is_free(q_goal)}")
+
+    # Plan with RRT
+    path = rrt_plan(
+        q_start=q_start,
+        q_goal=q_goal,
+        is_free=is_free,
+        joints_lower_limits=joints_lower_limits,
+        joints_upper_limits=joints_upper_limits,
+        step_size=0.1,
+        goal_sample_rate=0.2,
+        max_iters=20000,
+        edge_resolution=0.02,
+        goal_tolerance=0.15
+    )
+
+    print(f"The RRT determined path length is {len(path)}")
+
+    # Play the trajectory
+    dt = 0.1
+    times = np.linspace(0.0, dt*(len(path) - 1), len(path))
+    knots = np.array(path).T
+    trajectory = PiecewisePolynomial.FirstOrderHold(times, knots)
+
+    # Cloned Context for visualization and to play/pause/reset
+    visualize_context = root_context.Clone()
+    visualize_plant_context = sim_plant.GetMyMutableContextFromRoot(visualize_context)
+
+    diagram.ForcedPublish(visualize_context)
+
+    try:
+        meshcat.DeleteRecording()
+    except Exception:
+        pass
+    meshcat.StartRecording()
+
+    T = times[-1]
+    t = 0.0
+
+    while t <= T:
+        visualize_context.SetTime(t)
+        q = trajectory.value(t).ravel()
+        sim_plant.SetPositions(visualize_plant_context, iiwa, q)
+        diagram.ForcedPublish(visualize_context)
+        # playback rate
+        t = t + 0.002
+
+    meshcat.PublishRecording()
 
     # Publish to see the geometry of the enviorment
     diagram.ForcedPublish(simulator.get_context())

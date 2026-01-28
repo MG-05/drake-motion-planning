@@ -26,6 +26,7 @@ StarterEnv:
     - add_model:
         name: iiwa
         file: package://drake_models/iiwa_description/urdf/iiwa14_primitive_collision.urdf
+#        q_start
         default_joint_positions:
           iiwa_joint_1: [-0.2]
           iiwa_joint_2: [0.79]
@@ -70,15 +71,15 @@ StarterEnv:
     # -------------------------
     # Object (foam brick)
     # -------------------------
-    - add_model:
-        name: foam_brick
-        file: package://drake_models/manipulation_station/061_foam_brick.sdf
-        default_free_body_pose:
-          base_link:
-            # Place the brick above the shelves without penetrating
-            base_frame: shelves::shelves_body
-            translation: [0.05, 0.0, 0.20]
-            rotation: !Rpy { deg: [0, 0, 0] }
+#    - add_model:
+#        name: foam_brick
+#        file: package://drake_models/manipulation_station/061_foam_brick.sdf
+#        default_free_body_pose:
+#          base_link:
+#            # Place the brick above the shelves without penetrating
+#            base_frame: shelves::shelves_body
+#            translation: [0.05, 0.0, 0.20]
+#            rotation: !Rpy { deg: [0, 0, 0] }
 
 # Make robot and driver rigid
   model_drivers:
