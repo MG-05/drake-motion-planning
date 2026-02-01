@@ -168,7 +168,7 @@ def main():
     # middle shelf = np.array([-0.1, -0.05, 0.39])
     # bottom shelf = np.array([-0.1, -0.05, 0.10])
     # outside = np.array([-0.30, -0.06, 0.44])
-    end_effector_pos_desired = np.array([-0.1, -0.05, 0.10])
+    end_effector_pos_desired = np.array([-0.1, -0.05, 0.63])
     # roll pitch yaw
     end_effector_rot_desired = RollPitchYaw(0.0, np.pi/4, 0.0).ToRotationMatrix()
     # Transform Matrix
