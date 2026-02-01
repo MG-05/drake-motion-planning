@@ -22,6 +22,7 @@ Set up the simulation environment that we can use a robot arm to plan in.
 Get the iiwa moving and be able to have the robot end-effector go from Point A to B.
 
 **Media:**
+<img width="1132" height="756" alt="scene_enviorment" src="https://github.com/user-attachments/assets/bf7c9862-b36a-4e61-9bd2-9eaa073f14cb" />
 
 ### Week 2 & 3 - Inverse Kinematics + Vanilla RRT 
 
@@ -53,4 +54,20 @@ sampled trees meet.
 - The second major problem is the jagged nature of the trajectory. This can be solved by doing **local trajectory
 optimization**.
 
-**Media:**
+**Media:**  
+Lower Shelf Inverse Kinematics
+
+https://github.com/user-attachments/assets/b29f0bf8-bba7-496c-9948-231a67df45c0
+
+Middle Shelf Inverse Kinematics
+
+https://github.com/user-attachments/assets/e5ccc8f2-0209-4959-8cad-8bd717a213bf
+
+Upper Shelf Inverse Kinematics
+
+https://github.com/user-attachments/assets/1a8a894c-0f86-4d84-9049-f5bb7f41dac4
+
+
+
+
+
