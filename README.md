@@ -7,7 +7,8 @@ Sampling-based motion planning in Drake with collision avoidance in a shelf envi
 
 ### Week 1 - Drake + Enviorment Setup
 
-**Goal:**
+**Goal:**  
+
 Set up the simulation environment that we can use a robot arm to plan in.
 
 **Accomplishments:** 
@@ -18,7 +19,8 @@ Set up the simulation environment that we can use a robot arm to plan in.
   - Brick Object for manipulation.
 - Set up Project organization and to-dos for each iteration.
 
-**Goals for Next Week:**
+**Goals for Next Week:**  
+
 Get the iiwa moving and be able to have the robot end-effector go from Point A to B.
 
 **Media:**
@@ -26,7 +28,8 @@ Get the iiwa moving and be able to have the robot end-effector go from Point A t
 
 ### Week 2 & 3 - Inverse Kinematics + Vanilla RRT 
 
-**Goal:**
+**Goal:**  
+
 Make the arm move reliably from a start end-effector configuration to a goal configuration 
 without colliding with obstacles.
 
@@ -44,7 +47,8 @@ path if possible on its own.
   also a **non-convex problem** and therefore required us to make an initial guess which was the iiwa's start position.
   This was done so hopefully the IK find a feasible joint configuration near the original start joint configuration.
   
-**Goals for Next Week:**
+**Goals for Next Week:**  
+
 The current pipeline with inverse kinematics and vanilla RRT is running into two major problems:
 - In the configuration space, the shelf is captured as a narrow space. This naturally means that vanilla RRT will 
 have a hard time finding a path if we place the goal end-effector too deep into a shelf. This is because RRT is a 
@@ -52,7 +56,9 @@ probabilistic sampler and sampling in tight regions is statically unlikely as co
 this with **RRT-Connect** which will run RRT in parallel from the start and end locations and hopefully have the two 
 sampled trees meet.
 - The second major problem is the jagged nature of the trajectory. This can be solved by doing **local trajectory
-optimization**.
+optimization**.  
+
+The goals for next week are to fix these two problems.
 
 **Media:**  
 Lower Shelf Inverse Kinematics
