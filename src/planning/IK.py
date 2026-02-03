@@ -1,94 +1,105 @@
 import numpy as np
 from pydrake.multibody.inverse_kinematics import InverseKinematics
-from pydrake.math import RigidTransform, RotationMatrix
+from pydrake.math import RotationMatrix
 from pydrake.solvers import Solve
 
 
 def solve_iiwa_ik_for_gripper_pose(
-        plant,
-        plant_context_current,
-        iiwa_instance,
-        wsg_instance,
-        desired_end_effector,
-        q_iiwa_seed,
-        position_tol=0.01,
-        theta_tol=0.01
+    plant,
+    root_context_current,
+    iiwa_instance,
+    wsg_instance,
+    desired_end_effector,
+    q_iiwa_seed,
+    position_tol=0.01,
+    theta_tol=0.01,
 ):
-    """
-    Returns the q_goal for iiwa that achieves the desired gripper pose desired_end_effector
-    """
+    # 1) Clone the ROOT context (so we don't mutate simulator state and because it errors otherwise)
+    ik_root_context = root_context_current.Clone()
 
-    # Create a fresh context and copy plant into it
-    ik_context = plant.CreateDefaultContext()
-    q0_all = plant.GetPositions(plant_context_current)
-    plant.SetPositions(ik_context, q0_all)
+    # 2) Extract the PLANT subcontext from the cloned root
+    plant_context = plant.GetMyMutableContextFromRoot(ik_root_context)
 
-    # Lock gripper finger joints
+    # 3) Read the current/start generalized positions
+    q0_all = plant.GetPositions(plant_context).copy()
+
+    # 4) Build IK on the PLANT context
+    ik = InverseKinematics(plant, plant_context)
+    prog = ik.prog()
+    q = ik.q()
+
+    # Fix wsg fingers
     for finger_name in ["left_finger_sliding_joint", "right_finger_sliding_joint"]:
         joint = plant.GetJointByName(finger_name, wsg_instance)
-        joint.Lock(ik_context)
+        i0 = joint.position_start()
+        n = joint.num_positions()
+        # iterate over all joints that belong to the finger model and retrieve each joint object
+        for k in range(n):
+            # put a bounding box for each joint that occupies indices i0 to i0+n-1
+            idx = i0 + k
+            prog.AddBoundingBoxConstraint(q0_all[idx], q0_all[idx], q[idx])
 
-    # lock free floating objects (for when I add back the foam brick)
+    # freeze brick when available:
     if plant.HasModelInstanceNamed("foam_brick"):
         brick = plant.GetModelInstanceByName("foam_brick")
         for joint_index in plant.GetJointIndices(brick):
-            plant.get_joint(joint_index).Lock(ik_context)
-
-    # Build IK using the context. Note that Drake does so as a constrained optimization problem
-    # decision variables are q
-    ik = InverseKinematics(plant, ik_context)
-    opt_program = ik.prog()
-    q = ik.q()
+            joint = plant.get_joint(joint_index)
+            i0 = joint.position_start()
+            n = joint.num_positions()
+            # iterate over all joints that belong to the finger model and retrieve each joint objec
+            for k in range(n):
+                # put a bounding box for each joint that occupies indices i0 to i0+n-1
+                idx = i0 + k
+                prog.AddBoundingBoxConstraint(q0_all[idx], q0_all[idx], q[idx])
 
     world_frame = plant.world_frame()
     end_effector = plant.GetFrameByName("body", wsg_instance)
 
-    # Add Positional Constraints (xyz)
-    position_desired = desired_end_effector.translation()
+    # 5) Position constraint
+    p_W_des = desired_end_effector.translation()
     ik.AddPositionConstraint(
-        frameB = end_effector,
+        frameB=end_effector,
         p_BQ=np.zeros(3),
         frameA=world_frame,
-        p_AQ_lower=position_desired - position_tol,
-        p_AQ_upper=position_desired + position_tol,
+        p_AQ_lower=p_W_des - position_tol,
+        p_AQ_upper=p_W_des + position_tol,
     )
 
-    # Add Rotational Constraints
-    rotation_desired = desired_end_effector.rotation()
+    # 6) Orientation constraint
+    R_W_des = desired_end_effector.rotation()
     ik.AddOrientationConstraint(
         frameAbar=world_frame,
-        R_AbarA=rotation_desired,
+        R_AbarA=R_W_des,
         frameBbar=end_effector,
         R_BbarB=RotationMatrix(),
-        theta_bound=theta_tol
+        theta_bound=theta_tol,
     )
 
-    # Prefer a solution with the above constraints that is near the current seeded location.
-    # This is to prevent multiple solutions for IK that may cause the analytical average to be bad.
-    joint_names = [f"iiwa_joint_{i}" for i in range(1, 8)]
-    q_iiwa_variables = []
-    for joint_name in joint_names:
-        joint = plant.GetJointByName(joint_name, iiwa_instance)
-        start_pos = joint.position_start()
-        number_of_pos = joint.num_positions()
-        q_iiwa_variables.extend(list(q[start_pos:start_pos + number_of_pos]))
+    # 7) Add cost to stay near seed (inital q0) on iiwa joints
+    q_iiwa_vars = []
+    for name in [f"iiwa_joint_{i}" for i in range(1, 8)]:
+        j = plant.GetJointByName(name, iiwa_instance)
+        i0 = j.position_start()
+        q_iiwa_vars.append(q[i0])
+    q_iiwa_vars = np.array(q_iiwa_vars)
 
-    q_iiwa_variables = np.array(q_iiwa_variables)
+    prog.AddQuadraticErrorCost(np.eye(7), q_iiwa_seed, q_iiwa_vars)
 
-    # Add a stay close convex cost to minimize: ||q_iiwa_seed - q_iiwa_variables||^2
-    Q = np.eye(7)
-    opt_program.AddQuadraticErrorCost(Q, q_iiwa_seed, q_iiwa_variables)
-
-    # Set initial guess
-    opt_program.SetInitialGuess(q, q0_all)
-    result = Solve(opt_program)
+    # 8) Initial guess and solve
+    prog.SetInitialGuess(q, q0_all)
+    result = Solve(prog)
+    # info if IK solver fails
     if not result.is_success():
-        raise Exception("IK Optimization failed")
+        print("Solver:", result.get_solver_id().name())
+        print("SolutionResult:", result.get_solution_result())
+        try:
+            print("InfeasibleConstraintNames:", result.GetInfeasibleConstraintNames(prog))
+        except Exception as e:
+            print("Infeasible-constraint reporting unavailable:", e)
+        raise RuntimeError("IK Optimization failed")
 
-    # Extract q_goal for the iiwa
-    q_solution_all = result.GetSolution(q)
+    q_sol = result.GetSolution(q)
 
-    plant.SetPositions(ik_context, q_solution_all)
-    q_goal_iiwa_only = plant.GetPositions(ik_context, iiwa_instance).copy()
-
-    return q_goal_iiwa_only
+    # 9) Extract iiwa-only solution using the PLANT context
+    plant.SetPositions(plant_context, q_sol)
+    return plant.GetPositions(plant_context, iiwa_instance).copy()

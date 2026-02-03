@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from pydrake.common.yaml import yaml_load_typed
-from pydrake.geometry import Meshcat, SceneGraphConfig
+from pydrake.geometry import Meshcat, SceneGraphConfig, CollisionFilterDeclaration, GeometrySet
 from pydrake.lcm import DrakeLcmParams
 from pydrake.manipulation import (
     ApplyDriverConfigs,
@@ -27,9 +27,14 @@ from pydrake.trajectories import PiecewisePolynomial
 from pydrake.visualization import ApplyVisualizationConfig, VisualizationConfig
 from pydrake.math import RigidTransform, RollPitchYaw
 
+# LCM imports
+from drake import lcmt_iiwa_command, lcmt_schunk_wsg_command
+from pydrake.lcm import DrakeLcm
+
 from src.planning.IK import solve_iiwa_ik_for_gripper_pose
 from src.planning.collision import is_collision_free
 from src.planning.rrt import rrt_plan
+from src.planning.rrt_connect import rrt_connect_plan
 
 
 @dc.dataclass
@@ -163,20 +168,35 @@ def main():
 
     # Inverse Kinematics for Goal Config
     wsg = sim_plant.GetModelInstanceByName("wsg")
+    q_wsg_plan = sim_plant.GetPositions(plant_context, wsg).copy()
+
+    is_free = is_collision_free(
+        diagram=diagram,
+        plant=sim_plant,
+        scene_graph=scene_graph,
+        root_context=root_context,
+        iiwa_instance=iiwa,
+        wsg_instance=wsg,
+        q_wsg_instance=q_wsg_plan,
+        min_clearance=0.03,
+        pair_range=0.02,
+    )
+
+
     # xyz
-    # top shelf = np.array([-0.1, -0.05, 0.63])
-    # middle shelf = np.array([-0.1, -0.05, 0.39])
-    # bottom shelf = np.array([-0.1, -0.05, 0.10])
+    # top shelf = np.array([-0.20, 0.23, 0.63])
+    # middle shelf = np.array([0, 0.17, 0.39])
+    # bottom shelf = np.array([0.10, 0.10, 0.23])
     # outside = np.array([-0.30, -0.06, 0.44])
-    end_effector_pos_desired = np.array([-0.1, -0.05, 0.63])
+    end_effector_pos_desired =  np.array([-0.10, 0.23, 0.63])
     # roll pitch yaw
-    end_effector_rot_desired = RollPitchYaw(0.0, np.pi/4, 0.0).ToRotationMatrix()
+    end_effector_rot_desired = RollPitchYaw(0.0, 0.0, 0.0).ToRotationMatrix()
     # Transform Matrix
     transform_desired = RigidTransform(end_effector_rot_desired, end_effector_pos_desired)
 
     q_goal = solve_iiwa_ik_for_gripper_pose(
         plant=sim_plant,
-        plant_context_current=plant_context,
+        root_context_current=root_context,
         iiwa_instance=iiwa,
         wsg_instance=wsg,
         desired_end_effector=transform_desired,
@@ -198,66 +218,93 @@ def main():
     joints_lower_limits = np.asarray(joints_lower_limits)
     joints_upper_limits = np.asarray(joints_upper_limits)
 
-    # Do an inital check for collisions for the start and final configs
-    is_free = is_collision_free(diagram, sim_plant, scene_graph, root_context, iiwa)
-
     print(f"Is the start config collision free? {is_free(q_start)}")
     print(f"Is the goal config collision free? {is_free(q_goal)}")
 
-    # Plan with RRT
-    path = rrt_plan(
+    # Plan with RRT-Connect
+    path = rrt_connect_plan(
         q_start=q_start,
         q_goal=q_goal,
         is_free=is_free,
         joints_lower_limits=joints_lower_limits,
         joints_upper_limits=joints_upper_limits,
-        step_size=0.1,
-        goal_sample_rate=0.2,
-        max_iters=20000,
-        edge_resolution=0.02,
-        goal_tolerance=0.15
+        step_size=0.12,
+        goal_sample_rate=0.20,
+        max_iters=50000,
+        edge_resolution=0.05,
     )
+
 
     print(f"The RRT determined path length is {len(path)}")
 
-    # Play the trajectory
-    dt = 0.1
-    times = np.linspace(0.0, dt*(len(path) - 1), len(path))
+    # Play the trajectory via velocity based times
+    vmax = 0.35  # rad/s
+    times = [0.0]
+    for i in range(len(path) - 1):
+        dq = np.abs(np.array(path[i + 1]) - np.array(path[i]))
+        seg_T = max(0.05, float(np.max(dq) / vmax))
+        times.append(times[-1] + seg_T)
+
+    times = np.array(times)
     knots = np.array(path).T
     trajectory = PiecewisePolynomial.FirstOrderHold(times, knots)
 
-    # Cloned Context for visualization and to play/pause/reset
-    visualize_context = root_context.Clone()
-    visualize_plant_context = sim_plant.GetMyMutableContextFromRoot(visualize_context)
+    lcm_url = scenario.lcm_buses["default"].lcm_url
+    lcm = DrakeLcm(lcm_url)
 
-    diagram.ForcedPublish(visualize_context)
+    iiwa_cmd = lcmt_iiwa_command()
+    iiwa_cmd.num_joints = 7
 
-    try:
-        meshcat.DeleteRecording()
-    except Exception:
-        pass
+    wsg_cmd = lcmt_schunk_wsg_command()
+    wsg_cmd.force = 20.0
+    # Gripper's position in mm (0.000 mm means closed, 0.001 = 1mm)
+    wsg_cmd.target_position_mm = 0.001
+
+    # Reset sim state to the known start before executing
+    sim_plant.SetPositions(plant_context, iiwa, q_start)
+    sim_plant.SetVelocities(plant_context, iiwa, np.zeros(sim_plant.num_velocities(iiwa)))
+
+    # Publish Driver
+    t0 = 0.0
+    iiwa_cmd.joint_position = trajectory.value(t0).ravel()
+    lcm.Publish(channel="IIWA_COMMAND", buffer=iiwa_cmd.encode())
+    lcm.Publish(channel="SCHUNK_WSG_COMMAND", buffer=wsg_cmd.encode())
+
+    # advance simulator while pushing commands
+    command_dt = 0.01
+    T = float(times[-1])
+
+    # Start Recording so we can use play/reset/pause buttons
     meshcat.StartRecording()
 
-    T = times[-1]
+    # run simulator for time T
     t = 0.0
+    while t < T:
+        t_next = min(t + command_dt, T)
 
-    while t <= T:
-        visualize_context.SetTime(t)
-        q = trajectory.value(t).ravel()
-        sim_plant.SetPositions(visualize_plant_context, iiwa, q)
-        diagram.ForcedPublish(visualize_context)
-        # playback rate
-        t = t + 0.002
+        q_des = trajectory.value(t_next).ravel()
+        iiwa_cmd.joint_position = q_des
+
+        lcm.Publish(channel="IIWA_COMMAND", buffer=iiwa_cmd.encode())
+        lcm.Publish(channel="SCHUNK_WSG_COMMAND", buffer=wsg_cmd.encode())
+
+        simulator.AdvanceTo(t_next)
+        t = t_next
+
+    # Hold final command for a bit (1 sec.)
+    hold_time = 1.0
+    t_hold_end = T + hold_time
+    while t < t_hold_end:
+        t_next = min(t + command_dt, t_hold_end)
+
+        iiwa_cmd.joint_position = trajectory.value(T).ravel()
+        lcm.Publish(channel="IIWA_COMMAND", buffer=iiwa_cmd.encode())
+        lcm.Publish(channel="SCHUNK_WSG_COMMAND", buffer=wsg_cmd.encode())
+
+        simulator.AdvanceTo(t_next)
+        t = t_next
 
     meshcat.PublishRecording()
-
-    # Publish to see the geometry of the enviorment
-    diagram.ForcedPublish(simulator.get_context())
-
-    # have scenario.simulation_duration set to +inf so will run the init environment indefinitely
-    duration = float(args.duration) if args.duration is not None else float(scenario.simulation_duration)
-    print(f"[Sim] Advancing to t = {duration:.3f} s")
-    simulator.AdvanceTo(duration)
 
     return 0
 
