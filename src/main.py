@@ -304,7 +304,11 @@ def main():
         simulator.AdvanceTo(t_next)
         t = t_next
 
+    meshcat.StopRecording()
     meshcat.PublishRecording()
+    meshcat.StaticHtml()
+    with open("rrt_connect.html", "w") as f:
+        f.write(meshcat.StaticHtml())
 
     return 0
 

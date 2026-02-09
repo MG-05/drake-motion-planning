@@ -74,6 +74,38 @@ Upper Shelf Inverse Kinematics
 https://github.com/user-attachments/assets/1a8a894c-0f86-4d84-9049-f5bb7f41dac4
 
 
+### Week 4 - RRT-Connect
+
+**Goal:**  
+
+Make the arm move reliably from a start end-effector configuration to a goal configuration even when the goal config is
+deep into the shelf
+
+**Accomplishments:**
+- Implemented **RRT-Connect** so every feasible config is reachable through probabilistic samplers. We can now reach into 
+much deeper into the shelf.
+- Implemented LCM to simulate within Drake. This allows the simulator to pick up on robot-robot and robot-enviornoment
+collisions. Moreover, LCM simulation directly transfers to robot so simulating this is far beneficial for our long term 
+goals of running the contact-rich manipulation on the a robot.
+
+**Challenges Overcome:**
+- LCM Collision Checker Tradeoffs
+  - When running RRT-Connect we need a collision checker. The problem is that this collision checker checks against the
+  environment and the robot itself. Checking against the robot is far too computational intensive causing the entire
+  RRT-Connect to take about 2x more time. Fortunately, for our use-case we only are moving the final few joints allowing
+  us to void the robot-robot checks. Therefore, we only do robot-enviorment checks allowing our RRT-Connect to converge
+  much faster. The makes the average of 3000 iterations finish in a few seconds, as to a few minutes with robot-robot
+  checks. 
+  
+**Goals for Next Week:**  
+
+The next major goal is to get contract-rich manipulation and be able to move objects within the shelf. The next major
+challenge we have is also to improve the RRT-Connect. The major problem we see is that since we keep the first connected 
+tree in the RRT-Connect tree, we often get extraneous paths as shown below. The fix for this is to use a better and more
+recent algorithm: Bi-RRT*.
+
+**Media:**  
+Lower Shelf Inverse Kinematics
 
 
 
