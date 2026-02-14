@@ -104,8 +104,18 @@ challenge we have is also to improve the RRT-Connect. The major problem we see i
 tree in the RRT-Connect tree, we often get extraneous paths as shown below. The fix for this is to use a better and more
 recent algorithm: Bi-RRT*.
 
+https://github.com/user-attachments/assets/525f8280-9161-40b9-b4a1-a574fffa39f0
+
 **Media:**  
-Lower Shelf Inverse Kinematics
+Lower Shelf RRT-Connect
 
+https://github.com/user-attachments/assets/63a17284-b79e-4822-9e18-5c4a511ddf62
 
+Middle Shelf RRT-Connect
+
+https://github.com/user-attachments/assets/9c16b3d8-a67f-4074-8d0c-383fa3877e28
+
+Upper Shelf RRT-Connect
+
+https://github.com/user-attachments/assets/ab93d09a-441c-4219-9d4c-3d20a5a6db17
 
