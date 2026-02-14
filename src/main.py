@@ -155,6 +155,43 @@ def main():
     root_context = simulator.get_mutable_context()
     plant_context = sim_plant.GetMyMutableContextFromRoot(root_context)
 
+    # Place the foam brick only if it is a free body to avoid floating-base asserts.
+    if sim_plant.HasModelInstanceNamed("foam_brick"):
+        brick_instance = sim_plant.GetModelInstanceByName("foam_brick")
+        brick_body = None
+        for body_index in sim_plant.GetBodyIndices(brick_instance):
+            body = sim_plant.get_body(body_index)
+            if body.is_floating():
+                brick_body = body
+                break
+
+        if brick_body is None:
+            print("Warning: foam_brick has no floating body; skipping free-body pose.")
+        else:
+            X_SB = RigidTransform(
+                RollPitchYaw(0.0, 0.0, 0.0).ToRotationMatrix(),
+                [0.05, 0.0, 0.20],
+            )
+            X_WB = None
+            if sim_plant.HasModelInstanceNamed("shelves"):
+                shelves_instance = sim_plant.GetModelInstanceByName("shelves")
+                try:
+                    shelves_body = sim_plant.GetBodyByName("shelves_body", shelves_instance)
+                    X_WS = sim_plant.CalcRelativeTransform(
+                        plant_context,
+                        sim_plant.world_frame(),
+                        shelves_body.body_frame(),
+                    )
+                    X_WB = X_WS @ X_SB
+                except Exception:
+                    X_WB = None
+            if X_WB is None:
+                X_WB = RigidTransform(
+                    RollPitchYaw(0.0, 0.0, math.radians(-90.0)).ToRotationMatrix(),
+                    [0.0, 0.15, 0.5995],
+                )
+            sim_plant.SetFreeBodyPose(plant_context, brick_body, X_WB)
+
     iiwa = sim_plant.GetModelInstanceByName("iiwa")
 
     # Start Config
@@ -166,9 +203,10 @@ def main():
     # q_goal[1] = q_goal[1] - 0.4
     # q_goal[2] = q_goal[2] - 1.4
 
-    # Inverse Kinematics for Goal Config
+    # Inverse Kinematics for Goal Config with collision check on final claw position
     wsg = sim_plant.GetModelInstanceByName("wsg")
     q_wsg_plan = sim_plant.GetPositions(plant_context, wsg).copy()
+
 
     is_free = is_collision_free(
         diagram=diagram,
@@ -179,7 +217,7 @@ def main():
         wsg_instance=wsg,
         q_wsg_instance=q_wsg_plan,
         min_clearance=0.03,
-        pair_range=0.02,
+        pair_range=0.05,
     )
 
 
@@ -188,7 +226,7 @@ def main():
     # middle shelf = np.array([0, 0.17, 0.39])
     # bottom shelf = np.array([0.10, 0.10, 0.23])
     # outside = np.array([-0.30, -0.06, 0.44])
-    end_effector_pos_desired =  np.array([-0.10, 0.23, 0.63])
+    end_effector_pos_desired =  np.array([0, 0.17, 0.39])
     # roll pitch yaw
     end_effector_rot_desired = RollPitchYaw(0.0, 0.0, 0.0).ToRotationMatrix()
     # Transform Matrix
@@ -257,8 +295,11 @@ def main():
 
     wsg_cmd = lcmt_schunk_wsg_command()
     wsg_cmd.force = 20.0
-    # Gripper's position in mm (0.000 mm means closed, 0.001 = 1mm)
-    wsg_cmd.target_position_mm = 0.001
+    # # Gripper's position in mm (0 mm means closed, 1 = 1mm)
+    # wsg_cmd.target_position_mm = 0.01
+
+    wsg_closed_mm = 0.001
+    wsg_open_mm = 100.0
 
     # Reset sim state to the known start before executing
     sim_plant.SetPositions(plant_context, iiwa, q_start)
@@ -274,6 +315,9 @@ def main():
     command_dt = 0.01
     T = float(times[-1])
 
+    # open wsg once reached destination
+    open_wsg_after = T
+
     # Start Recording so we can use play/reset/pause buttons
     meshcat.StartRecording()
 
@@ -284,6 +328,7 @@ def main():
 
         q_des = trajectory.value(t_next).ravel()
         iiwa_cmd.joint_position = q_des
+        wsg_cmd.target_position_mm = wsg_closed_mm
 
         lcm.Publish(channel="IIWA_COMMAND", buffer=iiwa_cmd.encode())
         lcm.Publish(channel="SCHUNK_WSG_COMMAND", buffer=wsg_cmd.encode())
@@ -298,6 +343,8 @@ def main():
         t_next = min(t + command_dt, t_hold_end)
 
         iiwa_cmd.joint_position = trajectory.value(T).ravel()
+        wsg_cmd.target_position_mm = wsg_open_mm
+
         lcm.Publish(channel="IIWA_COMMAND", buffer=iiwa_cmd.encode())
         lcm.Publish(channel="SCHUNK_WSG_COMMAND", buffer=wsg_cmd.encode())
 
