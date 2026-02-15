@@ -25,7 +25,7 @@ from pydrake.systems.framework import DiagramBuilder
 from pydrake.systems.lcm import ApplyLcmBusConfig
 from pydrake.trajectories import PiecewisePolynomial
 from pydrake.visualization import ApplyVisualizationConfig, VisualizationConfig
-from pydrake.math import RigidTransform, RollPitchYaw
+from pydrake.math import RigidTransform, RollPitchYaw, RotationMatrix
 
 # LCM imports
 from drake import lcmt_iiwa_command, lcmt_schunk_wsg_command
@@ -35,6 +35,7 @@ from src.planning.IK import solve_iiwa_ik_for_gripper_pose
 from src.planning.collision import is_collision_free
 from src.planning.rrt import rrt_plan
 from src.planning.rrt_connect import rrt_connect_plan
+from src.manipulation.pregrasp import get_floating_body, compute_pregrasp_pose_for_brick
 
 
 @dc.dataclass
@@ -168,28 +169,37 @@ def main():
         if brick_body is None:
             print("Warning: foam_brick has no floating body; skipping free-body pose.")
         else:
-            X_SB = RigidTransform(
-                RollPitchYaw(0.0, 0.0, 0.0).ToRotationMatrix(),
-                [0.05, 0.0, 0.20],
+            # X_SB = RigidTransform(
+            #     RollPitchYaw(0.0, 0.0, 0.0).ToRotationMatrix(),
+            #     [0.05, 0.0, 0.20],
+            # )
+            # X_WB = None
+            # if sim_plant.HasModelInstanceNamed("shelves"):
+            #     shelves_instance = sim_plant.GetModelInstanceByName("shelves")
+            #     try:
+            #         shelves_body = sim_plant.GetBodyByName("shelves_body", shelves_instance)
+            #         X_WS = sim_plant.CalcRelativeTransform(
+            #             plant_context,
+            #             sim_plant.world_frame(),
+            #             shelves_body.body_frame(),
+            #         )
+            #         X_WB = X_WS @ X_SB
+            #     except Exception:
+            #         X_WB = None
+            # if X_WB is None:
+            #     X_WB = RigidTransform(
+            #         RollPitchYaw(0.0, 0.0, math.radians(-90.0)).ToRotationMatrix(),
+            #         [0.0, 0.15, 0.5995],
+            #     )
+            # for bi in sim_plant.GetBodyIndices(brick_instance):
+            #     print(sim_plant.get_body(bi).name())
+
+            # Lower shelf -> [0.0, 0.15, 0.030],
+            # Middle Shelf
+            X_WB = RigidTransform(
+                RollPitchYaw(0.0, 0.0, math.radians(-90.0)).ToRotationMatrix(),
+                [0.0, 0.15, 0.40],
             )
-            X_WB = None
-            if sim_plant.HasModelInstanceNamed("shelves"):
-                shelves_instance = sim_plant.GetModelInstanceByName("shelves")
-                try:
-                    shelves_body = sim_plant.GetBodyByName("shelves_body", shelves_instance)
-                    X_WS = sim_plant.CalcRelativeTransform(
-                        plant_context,
-                        sim_plant.world_frame(),
-                        shelves_body.body_frame(),
-                    )
-                    X_WB = X_WS @ X_SB
-                except Exception:
-                    X_WB = None
-            if X_WB is None:
-                X_WB = RigidTransform(
-                    RollPitchYaw(0.0, 0.0, math.radians(-90.0)).ToRotationMatrix(),
-                    [0.0, 0.15, 0.5995],
-                )
             sim_plant.SetFreeBodyPose(plant_context, brick_body, X_WB)
 
     iiwa = sim_plant.GetModelInstanceByName("iiwa")
@@ -216,12 +226,13 @@ def main():
         iiwa_instance=iiwa,
         wsg_instance=wsg,
         q_wsg_instance=q_wsg_plan,
-        min_clearance=0.03,
+        min_clearance=0.01,
         pair_range=0.05,
     )
 
-
-    # xyz
+    # -------------------------
+    # Manually define goal end-effector pos + rot
+    # -------------------------
     # top shelf = np.array([-0.20, 0.23, 0.63])
     # middle shelf = np.array([0, 0.17, 0.39])
     # bottom shelf = np.array([0.10, 0.10, 0.23])
@@ -229,6 +240,25 @@ def main():
     end_effector_pos_desired =  np.array([0, 0.17, 0.39])
     # roll pitch yaw
     end_effector_rot_desired = RollPitchYaw(0.0, 0.0, 0.0).ToRotationMatrix()
+
+    # -------------------------
+    # Pre-grasp target for the foam brick
+    # -------------------------
+    brick_body = get_floating_body(sim_plant, brick_instance)
+
+    X_WG_pregrasp = compute_pregrasp_pose_for_brick(
+        plant=sim_plant,
+        plant_context=plant_context,
+        iiwa_instance=iiwa,
+        brick_body=brick_body,
+        fingertip_clearance_m=0.04,  # "few cm away"
+        wsg_body_to_fingertips_m=0.14,  # practical constant; tune if needed
+    )
+
+    end_effector_pos_desired = X_WG_pregrasp.translation()
+    end_effector_rot_desired = X_WG_pregrasp.rotation()
+    print("\n[Pregrasp] X_WG_pregrasp =", X_WG_pregrasp)
+
     # Transform Matrix
     transform_desired = RigidTransform(end_effector_rot_desired, end_effector_pos_desired)
 
@@ -239,7 +269,7 @@ def main():
         wsg_instance=wsg,
         desired_end_effector=transform_desired,
         q_iiwa_seed=q_start,
-        position_tol=0.05,
+        position_tol=0.005,
         theta_tol=0.05,
     )
 
@@ -314,9 +344,6 @@ def main():
     # advance simulator while pushing commands
     command_dt = 0.01
     T = float(times[-1])
-
-    # open wsg once reached destination
-    open_wsg_after = T
 
     # Start Recording so we can use play/reset/pause buttons
     meshcat.StartRecording()
