@@ -1,6 +1,18 @@
 import numpy as np
 
-def is_collision_free(diagram, plant, scene_graph, root_context, iiwa_instance, wsg_instance=None, q_wsg_instance=None, min_clearance=0.005, pair_range=0.03):
+
+def is_collision_free(
+    plant,
+    scene_graph,
+    root_context,
+    iiwa_instance,
+    wsg_instance=None,
+    q_wsg_instance=None,
+    min_clearance=0.005,
+    pair_range=0.03,
+    ignore_model_instances=None,
+    extra_checked_model_instances=None,
+):
     """
     Returns a function is_free for a given model instance. We will use SceneGraph
     QueryObject penetrations as a collision test.
@@ -37,6 +49,26 @@ def is_collision_free(diagram, plant, scene_graph, root_context, iiwa_instance, 
             for gid in plant.GetCollisionGeometriesForBody(body):
                 robot_geom_ids.add(gid)
 
+    # Optional payload or other models to include to robot geometry as part of the moving body.
+    if extra_checked_model_instances is not None:
+        for inst in extra_checked_model_instances:
+            if inst is None:
+                continue
+            for body_index in plant.GetBodyIndices(inst):
+                body = plant.get_body(body_index)
+                for gid in plant.GetCollisionGeometriesForBody(body):
+                    robot_geom_ids.add(gid)
+
+    ignored_geom_ids = set()
+    if ignore_model_instances is not None:
+        for inst in ignore_model_instances:
+            if inst is None:
+                continue
+            for body_index in plant.GetBodyIndices(inst):
+                body = plant.get_body(body_index)
+                for gid in plant.GetCollisionGeometriesForBody(body):
+                    ignored_geom_ids.add(gid)
+
     def is_free(q_iiwa):
         q_iiwa = np.asarray(q_iiwa).reshape((number_iiwa,))
         plant.SetPositions(plant_context, iiwa_instance, q_iiwa)
@@ -56,6 +88,8 @@ def is_collision_free(diagram, plant, scene_graph, root_context, iiwa_instance, 
             a_robot = (pen.id_A in robot_geom_ids)
             b_robot = (pen.id_B in robot_geom_ids)
             if a_robot != b_robot:
+                if (pen.id_A in ignored_geom_ids) or (pen.id_B in ignored_geom_ids):
+                    continue
                 robot_env_pens.append(pen)
 
         if min_clearance <= 1e-12:
@@ -77,6 +111,8 @@ def is_collision_free(diagram, plant, scene_graph, root_context, iiwa_instance, 
                 a_robot = (p.id_A in robot_geom_ids)
                 b_robot = (p.id_B in robot_geom_ids)
                 if a_robot != b_robot:
+                    if (p.id_A in ignored_geom_ids) or (p.id_B in ignored_geom_ids):
+                        continue
                     if p.distance < min_d:
                         # take note of the smallest robot to enviorment distance
                         min_d = p.distance
@@ -86,4 +122,3 @@ def is_collision_free(diagram, plant, scene_graph, root_context, iiwa_instance, 
             return True
 
     return is_free
-
