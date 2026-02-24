@@ -27,7 +27,7 @@ class ManipulationOptions:
     """
     position_tol: float = 0.005
     theta_tol: float = 0.05
-    ik_soft_starts: int = 12
+    ik_soft_starts: int = 20
     ik_soft_start_sigma: float = 0.08
     ik_soft_start_seed: int = 0
     rrt_step_size: float = 0.12
@@ -86,6 +86,9 @@ class ManipulationFSM:
         joints_upper_limits: np.ndarray,
         is_free_grasp: typing.Callable[[np.ndarray], bool] | None = None,
         is_free_carry: typing.Callable[[np.ndarray], bool] | None = None,
+        q_wsg_carry: np.ndarray | None = None,
+        carry_payload_instance=None,
+        carry_payload_carrier_frame_name: str = "body",
         options: ManipulationOptions | None = None,
     ):
         self.plant = plant
@@ -95,6 +98,9 @@ class ManipulationFSM:
         self.is_free = is_free
         self.is_free_grasp = is_free_grasp or is_free
         self.is_free_carry = is_free_carry or self.is_free_grasp
+        self.q_wsg_carry = None if q_wsg_carry is None else np.asarray(q_wsg_carry, dtype=float).copy()
+        self.carry_payload_instance = carry_payload_instance
+        self.carry_payload_carrier_frame_name = str(carry_payload_carrier_frame_name)
         self.joints_lower_limits = np.asarray(joints_lower_limits, dtype=float).reshape(7)
         self.joints_upper_limits = np.asarray(joints_upper_limits, dtype=float).reshape(7)
         self.options = options or ManipulationOptions()
@@ -102,6 +108,49 @@ class ManipulationFSM:
 
     def _transition(self, state: ManipulationState) -> None:
         self._history.append(state)
+
+    def _configure_carry_payload_attachment(self, q_grasp: np.ndarray) -> None:
+        if self.carry_payload_instance is None:
+            return
+        configure_fn = getattr(self.is_free_carry, "configure_attached_model", None)
+        if not callable(configure_fn):
+            return
+
+        ctx = self.root_context_current.Clone()
+        plant_context = self.plant.GetMyMutableContextFromRoot(ctx)
+
+        q_grasp = np.asarray(q_grasp, dtype=float).reshape(7)
+        self.plant.SetPositions(plant_context, self.iiwa_instance, q_grasp)
+        if self.q_wsg_carry is not None:
+            self.plant.SetPositions(plant_context, self.wsg_instance, self.q_wsg_carry)
+
+        payload_body = None
+        for body_index in self.plant.GetBodyIndices(self.carry_payload_instance):
+            body = self.plant.get_body(body_index)
+            if body.is_floating():
+                payload_body = body
+                break
+        if payload_body is None:
+            raise RuntimeError(
+                f"Carry payload model instance {self.carry_payload_instance} has no floating body"
+            )
+
+        carrier_frame = self.plant.GetFrameByName(
+            self.carry_payload_carrier_frame_name,
+            self.wsg_instance,
+        )
+        X_WC = self.plant.CalcRelativeTransform(
+            plant_context, self.plant.world_frame(), carrier_frame
+        )
+        X_WB = self.plant.CalcRelativeTransform(
+            plant_context, self.plant.world_frame(), payload_body.body_frame()
+        )
+        X_CB = X_WC.inverse() @ X_WB
+        configure_fn(
+            model_instance=self.carry_payload_instance,
+            carrier_frame=carrier_frame,
+            X_CB=X_CB,
+        )
 
     def _plan_rrt(
         self,
@@ -185,6 +234,9 @@ class ManipulationFSM:
                 details = "; ".join(grasp_result.failure_reasons)
                 raise RuntimeError(f"Grasp primitive failed. {details}")
             grasp_plan = grasp_result.plan
+
+            # After grasp, treat payload as rigidly attached for carry/drop checks.
+            self._configure_carry_payload_attachment(grasp_plan.q_grasp)
 
             self._transition(ManipulationState.PLAN_PREGRASP_TO_DROP)
             q_drop = None

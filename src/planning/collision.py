@@ -69,12 +69,52 @@ def is_collision_free(
                 for gid in plant.GetCollisionGeometriesForBody(body):
                     ignored_geom_ids.add(gid)
 
+    # Rigidly attached payload model that should move with a carrier frame.
+    attached_model = {
+        "model_instance": None,
+        "floating_body": None,
+        "carrier_frame": None,
+        "X_CB": None,
+    }
+
+    def configure_attached_model(model_instance, carrier_frame, X_CB):
+        payload_body = None
+        for body_index in plant.GetBodyIndices(model_instance):
+            body = plant.get_body(body_index)
+            if body.is_floating():
+                payload_body = body
+                break
+        if payload_body is None:
+            raise RuntimeError(
+                f"Model instance {model_instance} has no floating body to attach for carry checking"
+            )
+        attached_model["model_instance"] = model_instance
+        attached_model["floating_body"] = payload_body
+        attached_model["carrier_frame"] = carrier_frame
+        attached_model["X_CB"] = X_CB
+
+    def clear_attached_model():
+        attached_model["model_instance"] = None
+        attached_model["floating_body"] = None
+        attached_model["carrier_frame"] = None
+        attached_model["X_CB"] = None
+
     def is_free(q_iiwa):
         q_iiwa = np.asarray(q_iiwa).reshape((number_iiwa,))
         plant.SetPositions(plant_context, iiwa_instance, q_iiwa)
 
         if wsg_instance is not None:
             plant.SetPositions(plant_context, wsg_instance, q_wsg_fixed)
+
+        # If configured, move the payload rigidly with the carrier frame.
+        if attached_model["floating_body"] is not None:
+            X_WC = plant.CalcRelativeTransform(
+                plant_context,
+                plant.world_frame(),
+                attached_model["carrier_frame"],
+            )
+            X_WB = X_WC @ attached_model["X_CB"]
+            plant.SetFreeBodyPose(plant_context, attached_model["floating_body"], X_WB)
 
         query = scene_graph.get_query_output_port().Eval(scene_graph_context)
 
@@ -120,5 +160,8 @@ def is_collision_free(
                         # clearence violated so reject config
                         return False
             return True
+
+    is_free.configure_attached_model = configure_attached_model
+    is_free.clear_attached_model = clear_attached_model
 
     return is_free

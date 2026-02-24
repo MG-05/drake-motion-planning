@@ -118,15 +118,7 @@ def compute_pregrasp_pose_for_brick(
     wsg_body_to_fingertips_m: float = 0.14,
 ) -> RigidTransform:
     """
-    Computes a world-frame pregrasp pose X_WG for the *wsg::body* frame.
-
-    Thought process:
-    - User asked: “pre-grasp a few cm away from the brick on the axis of attack”.
-    - The attack axis is taken as robot-base → brick direction (XY-projected).
-    - The pregrasp distance should be measured from *fingertips*, but IK targets
-      the *wsg::body* frame. So we back off by:
-          (wsg_body_to_fingertips_m + fingertip_clearance_m)
-    - Result: fingertips end up ~fingertip_clearance_m away from brick.
+    Computes a world-frame pregrasp pose X_WG for the wsg::body frame.
 
     Returns:
     - X_WG (RigidTransform): desired pose of the gripper body frame in world.

@@ -275,6 +275,7 @@ def main():
     q_wsg_open_plan, q_wsg_closed_plan = _compute_wsg_planning_configs(q_wsg_open_plan)
 
 
+    # Note that only collision pairs within the pair_range thereshold are checked for clearance
     # Strict collision checker for transit motion (requires clearance margin).
     is_free = is_collision_free(
         plant=sim_plant,
@@ -307,7 +308,7 @@ def main():
         wsg_instance=wsg,
         q_wsg_instance=q_wsg_closed_plan,
         min_clearance=0.01,
-        pair_range=0.08,
+        pair_range=0.8,
         extra_checked_model_instances=[brick_instance],
     )
 
@@ -321,8 +322,10 @@ def main():
         plant_context=plant_context,
         iiwa_instance=iiwa,
         brick_body=brick_body,
-        fingertip_clearance_m=0.04,  # "few cm away"
-        wsg_body_to_fingertips_m=0.14,  # practical constant; tune if needed
+        # few cm away
+        fingertip_clearance_m=0.04,
+        # estimated length of fingers of wsg
+        wsg_body_to_fingertips_m=0.14,
     )
     print("\n[Pregrasp] X_WG_pregrasp =", X_WG_pregrasp)
 
@@ -334,7 +337,7 @@ def main():
     print(f"Is the start config collision free? {is_free(q_start)}")
 
     target_z = float(X_WG_pregrasp.translation()[2])
-    ik_soft_starts = 16 if 0.20 <= target_z <= 0.39 else 10
+    ik_soft_starts = 20
 
     grasp_options = GraspOptions(
         ik_soft_starts=ik_soft_starts,
@@ -357,6 +360,8 @@ def main():
         joints_upper_limits=joints_upper_limits,
         is_free_grasp=is_free_grasp,
         is_free_carry=is_free_carry,
+        q_wsg_carry=q_wsg_closed_plan,
+        carry_payload_instance=brick_instance,
         options=fsm_options,
     )
     fsm_result = fsm.run(
