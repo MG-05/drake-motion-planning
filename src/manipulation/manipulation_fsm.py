@@ -25,15 +25,15 @@ class ManipulationOptions:
     """
     Task-level options for pick-and-place planning.
     """
-    position_tol: float = 0.005
-    theta_tol: float = 0.05
+    position_tol: float = 0.001
+    theta_tol: float = 0.035
     ik_soft_starts: int = 20
     ik_soft_start_sigma: float = 0.08
     ik_soft_start_seed: int = 0
     rrt_step_size: float = 0.12
     rrt_goal_sample_rate: float = 0.20
     rrt_max_iters: int = 50_000
-    rrt_edge_resolution: float = 0.05
+    rrt_edge_resolution: float = 0.005
     drop_xy_offsets_m: tuple[tuple[float, float], ...] = (
         (0.0, 0.0),
         (0.03, 0.0),
@@ -169,6 +169,7 @@ class ManipulationFSM:
             goal_sample_rate=self.options.rrt_goal_sample_rate,
             max_iters=self.options.rrt_max_iters,
             edge_resolution=self.options.rrt_edge_resolution,
+            enable_shortcut=True,
         )
 
     def _iter_drop_candidates(self, X_WG_drop: RigidTransform):

@@ -105,6 +105,7 @@ def _plan_rrt_segment(
         goal_sample_rate=options.rrt_goal_sample_rate,
         max_iters=options.rrt_max_iters,
         edge_resolution=options.rrt_edge_resolution,
+        enable_shortcut=False,
     )
 
 

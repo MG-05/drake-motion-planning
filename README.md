@@ -102,7 +102,7 @@ goals of running the contact-rich manipulation on the a robot.
 The next major goal is to get contract-rich manipulation and be able to move objects within the shelf. The next major
 challenge we have is also to improve the RRT-Connect. The major problem we see is that since we keep the first connected 
 tree in the RRT-Connect tree, we often get extraneous paths as shown below. The fix for this is to use a better and more
-recent algorithm: Bi-RRT*.
+recent algorithm: Bi-RRT*. We also need to start considering manipulation since that is the final goal of this project.
 
 https://github.com/user-attachments/assets/525f8280-9161-40b9-b4a1-a574fffa39f0
 
@@ -119,3 +119,15 @@ Upper Shelf RRT-Connect
 
 https://github.com/user-attachments/assets/ab93d09a-441c-4219-9d4c-3d20a5a6db17
 
+### Week 5 - Pre-Grasp
+
+**Goal:**  
+The major goal for this week is to attain the pre-grasp position for being able to manipulate the brick. Pre-grasp is 
+defined as getting the robot in a position where it is just able to grasp. More concretely, it means to get the end-effector
+of the robot a few centimeters away from the object on the same axis of approach that we wish to grab.
+
+**Accomplishments:**
+
+**Challenges Overcome:**
+
+**Media:** 

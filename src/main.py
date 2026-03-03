@@ -259,7 +259,7 @@ def main():
             # Top Shelf -> [0.0, 0.15, 0.56]
             X_WB = RigidTransform(
                 RollPitchYaw(0.0, 0.0, math.radians(-90.0)).ToRotationMatrix(),
-                [0.0, 0.15, 0.30],
+                [0.0, 0.15, 0.030],
             )
             sim_plant.SetFreeBodyPose(plant_context, brick_body, X_WB)
     else:
@@ -307,7 +307,7 @@ def main():
         iiwa_instance=iiwa,
         wsg_instance=wsg,
         q_wsg_instance=q_wsg_closed_plan,
-        min_clearance=0.01,
+        min_clearance=0.011,
         pair_range=0.8,
         extra_checked_model_instances=[brick_instance],
     )
@@ -423,7 +423,7 @@ def main():
         ("pregrasp_to_drop", plan.path_pregrasp_to_drop, wsg_closed_mm),
     ]
     for segment_name, segment_path, gripper_target_mm in segments:
-        trajectory, duration = _build_trajectory_from_path(segment_path, vmax=0.35)
+        trajectory, duration = _build_trajectory_from_path(segment_path, vmax=0.25)
         print(f"Executing {segment_name}: {len(segment_path)} waypoints, {duration:.2f}s")
         _publish_and_advance_segment(
             simulator=simulator,

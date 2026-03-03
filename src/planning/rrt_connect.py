@@ -54,6 +54,42 @@ def edge_is_free(is_free, q0, q1, resolution=0.02):
             return False
     return True
 
+
+def shortcut_path(path, is_free, edge_resolution=0.01, max_passes=None):
+    """
+    Repeatedly tries to replace path sub-sequences with straight joint-space edges.
+    Stops when a full pass finds no valid shortcut, or max_passes is reached.
+    """
+
+    path = [np.asarray(q, dtype=float).copy() for q in path]
+    if len(path) <= 2:
+        return path
+
+    passes = 0
+    while True:
+        if max_passes is not None and passes >= max_passes:
+            break
+
+        improved = False
+        n = len(path)
+
+        # Try larger index gaps first to remove as many intermediate nodes as possible.
+        for gap in range(n - 1, 1, -1):
+            for i in range(0, n - gap):
+                j = i + gap
+                if edge_is_free(is_free, path[i], path[j], resolution=edge_resolution):
+                    path = path[: i + 1] + path[j:]
+                    improved = True
+                    break
+            if improved:
+                break
+
+        passes += 1
+        if not improved:
+            break
+
+    return path
+
 def trace_path(tree: Tree, idx: int):
     """Returns path from root to idx (inclusive)."""
     path = []
@@ -124,9 +160,14 @@ def rrt_connect_plan(
         edge_resolution=0.01,
         max_sample_tries=30,
         max_connect_steps=10000,
+        enable_shortcut=True,
+        shortcut_edge_resolution=None,
+        shortcut_max_passes=None,
 ):
     """
-    runs RRT-connect from start and goal. This will return a list of configurations from q_start to goal (inclusive)
+    Runs RRT-connect from start and goal, then optionally short-cuts the resulting
+    waypoint path.
+    Returns a list of configurations from q_start to q_goal (inclusive).
     """
 
     rng = np.random.default_rng()
@@ -203,7 +244,21 @@ def rrt_connect_plan(
 
                 # path_goal_to_conn is root(goal) -> ... -> conn, so reverse it to conn -> ... -> goal
                 path = path_start_to_conn + path_goal_to_conn[::-1][1:]
-                print(f"RRT-Connect succeeded in {iter} iterations. Path length: {len(path)}")
+                raw_len = len(path)
+                if enable_shortcut:
+                    shortcut_resolution = (
+                        edge_resolution if shortcut_edge_resolution is None else shortcut_edge_resolution
+                    )
+                    path = shortcut_path(
+                        path,
+                        is_free,
+                        edge_resolution=shortcut_resolution,
+                        max_passes=shortcut_max_passes,
+                    )
+                print(
+                    f"RRT-Connect succeeded in {iter} iterations. "
+                    f"Path length: {raw_len} -> {len(path)}"
+                )
                 return path
 
         # Swap roles each iteration to advance one another each time
