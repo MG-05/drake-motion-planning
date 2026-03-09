@@ -3,6 +3,7 @@ import argparse
 import dataclasses as dc
 import math
 import sys
+import time
 import typing
 import webbrowser
 from pathlib import Path
@@ -162,6 +163,7 @@ def _compute_wsg_planning_configs(q_wsg_open):
 
 
 def main():
+    wall_start_total = time.perf_counter()
 
     # sample parser arguments from source Drake code (slightly modified)
     parser = argparse.ArgumentParser(
@@ -259,7 +261,7 @@ def main():
             # Top Shelf -> [0.0, 0.15, 0.56]
             X_WB = RigidTransform(
                 RollPitchYaw(0.0, 0.0, math.radians(-90.0)).ToRotationMatrix(),
-                [0.0, 0.15, 0.030],
+                [0.0, 0.15, 0.30],
             )
             sim_plant.SetFreeBodyPose(plant_context, brick_body, X_WB)
     else:
@@ -299,7 +301,20 @@ def main():
         pair_range=0.05,
         ignore_model_instances=[brick_instance],
     )
-    # Carry checker for post-grasp transport/drop planning.
+    # De-approach checker for grasp->pregrasp retreat with payload attached.
+    is_free_deapproach = is_collision_free(
+        plant=sim_plant,
+        scene_graph=scene_graph,
+        root_context=root_context,
+        iiwa_instance=iiwa,
+        wsg_instance=wsg,
+        q_wsg_instance=q_wsg_closed_plan,
+        # Allow near-contact at grasp state; retreat should move out of the shelf.
+        min_clearance=0.0,
+        pair_range=0.12,
+        extra_checked_model_instances=[brick_instance],
+    )
+    # Carry checker for post-retreat transport/drop planning.
     is_free_carry = is_collision_free(
         plant=sim_plant,
         scene_graph=scene_graph,
@@ -343,11 +358,27 @@ def main():
         ik_soft_starts=ik_soft_starts,
         ik_soft_start_sigma=0.08,
         ik_soft_start_seed=0,
+        approach_prefer_straight_line=True,
+        approach_linear_step_m=0.01,
+        approach_linear_max_waypoints=20,
+        # Post-grasp retreat target relative to nominal pregrasp (world frame).
+        # Keep y at 0 to avoid perturbing grasp variant selection too much.
+        # Positive z lifts upward to reduce shelf scraping on retreat.
+        retreat_offset_world_y_m=0.0,
+        retreat_offset_world_z_m=0.015,
     )
     fsm_options = ManipulationOptions(
         ik_soft_starts=ik_soft_starts,
         ik_soft_start_sigma=0.08,
         ik_soft_start_seed=0,
+        max_planning_time_s=600.0,
+        # Fast drop-stage settings to avoid multi-minute planning tails.
+        drop_rrt_step_size=0.95,
+        drop_rrt_goal_sample_rate=0.35,
+        drop_rrt_max_iters=12_000,
+        drop_rrt_edge_resolution=0.03,
+        drop_rrt_time_budget_s=400.0,
+        max_drop_candidates=20,
         grasp_options=grasp_options,
     )
     fsm = ManipulationFSM(
@@ -359,6 +390,7 @@ def main():
         joints_lower_limits=joints_lower_limits,
         joints_upper_limits=joints_upper_limits,
         is_free_grasp=is_free_grasp,
+        is_free_deapproach=is_free_deapproach,
         is_free_carry=is_free_carry,
         q_wsg_carry=q_wsg_closed_plan,
         carry_payload_instance=brick_instance,
@@ -369,6 +401,20 @@ def main():
         X_WG_pregrasp=X_WG_pregrasp,
         X_WG_drop=X_WG_drop,
     )
+    if fsm_result.timings_s:
+        print("Planning timings (wall s):")
+        for key in (
+            "plan_home_to_pregrasp",
+            "plan_grasp_primitive",
+            "plan_pregrasp_to_drop",
+            "drop_candidates_tried",
+            "plan_total",
+        ):
+            if key in fsm_result.timings_s:
+                if key == "drop_candidates_tried":
+                    print(f"  {key}: {int(fsm_result.timings_s[key])}")
+                else:
+                    print(f"  {key}: {fsm_result.timings_s[key]:.3f}")
     if not fsm_result.success or fsm_result.plan is None:
         print("FSM transitions:", [s.value for s in fsm_result.transition_history])
         raise RuntimeError(f"Manipulation FSM failed: {fsm_result.error_message}")
@@ -380,6 +426,7 @@ def main():
     print(f"grasp->pregrasp path length: {len(plan.grasp_plan.path_grasp_to_pregrasp)}")
     print(f"pregrasp->drop path length: {len(plan.path_pregrasp_to_drop)}")
     print(f"selected grasp variant: {plan.grasp_plan.selected_variant_index}")
+    print(f"selected grasp variant params: {plan.grasp_plan.selected_variant}")
     print(f"selected drop candidate: {plan.drop_candidate_index}")
 
     lcm_url = scenario.lcm_buses["default"].lcm_url
@@ -389,7 +436,7 @@ def main():
     iiwa_cmd.num_joints = 7
 
     wsg_cmd = lcmt_schunk_wsg_command()
-    wsg_cmd.force = 30.0
+    wsg_cmd.force = 20.0
     # # Gripper's position in mm (0 mm means closed, 1 = 1mm)
     # wsg_cmd.target_position_mm = 0.01
 
@@ -402,8 +449,10 @@ def main():
 
     # Start recording so we can use play/reset/pause buttons.
     meshcat.StartRecording()
+    execution_timings_s: dict[str, float] = {}
 
     # Force closed fingers before any arm motion.
+    segment_wall_start = time.perf_counter()
     _hold_current_position(
         simulator=simulator,
         q_hold=q_start,
@@ -414,6 +463,7 @@ def main():
         gripper_target_mm=wsg_closed_mm,
         command_dt=0.01,
     )
+    execution_timings_s["hold_before_home_to_pregrasp"] = time.perf_counter() - segment_wall_start
 
     # Execute FSM segment plan with explicit gripper events.
     segments = [
@@ -425,6 +475,7 @@ def main():
     for segment_name, segment_path, gripper_target_mm in segments:
         trajectory, duration = _build_trajectory_from_path(segment_path, vmax=0.25)
         print(f"Executing {segment_name}: {len(segment_path)} waypoints, {duration:.2f}s")
+        segment_wall_start = time.perf_counter()
         _publish_and_advance_segment(
             simulator=simulator,
             trajectory=trajectory,
@@ -435,9 +486,11 @@ def main():
             gripper_target_mm=gripper_target_mm,
             command_dt=0.01,
         )
+        execution_timings_s[f"exec_{segment_name}"] = time.perf_counter() - segment_wall_start
 
         # Open at pregrasp before the approach-to-grasp segment.
         if segment_name == "home_to_pregrasp":
+            segment_wall_start = time.perf_counter()
             _hold_current_position(
                 simulator=simulator,
                 q_hold=plan.q_pregrasp,
@@ -448,9 +501,11 @@ def main():
                 gripper_target_mm=wsg_open_mm,
                 command_dt=0.01,
             )
+            execution_timings_s["hold_open_at_pregrasp"] = time.perf_counter() - segment_wall_start
 
         # Close after reaching grasp waypoint, before retreat.
         if segment_name == "pregrasp_to_grasp":
+            segment_wall_start = time.perf_counter()
             _hold_current_position(
                 simulator=simulator,
                 q_hold=plan.q_grasp,
@@ -461,8 +516,10 @@ def main():
                 gripper_target_mm=wsg_closed_mm,
                 command_dt=0.01,
             )
+            execution_timings_s["hold_close_at_grasp"] = time.perf_counter() - segment_wall_start
 
     # Open and settle at drop.
+    segment_wall_start = time.perf_counter()
     _hold_current_position(
         simulator=simulator,
         q_hold=plan.q_drop,
@@ -473,6 +530,13 @@ def main():
         gripper_target_mm=wsg_open_mm,
         command_dt=0.01,
     )
+    execution_timings_s["hold_open_at_drop"] = time.perf_counter() - segment_wall_start
+
+    print("Execution timings (wall s):")
+    for key, value in execution_timings_s.items():
+        print(f"  {key}: {value:.3f}")
+    print(f"  execution_total: {sum(execution_timings_s.values()):.3f}")
+    print(f"End-to-end wall time: {time.perf_counter() - wall_start_total:.3f}s")
 
     meshcat.StopRecording()
     meshcat.PublishRecording()

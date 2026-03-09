@@ -1,5 +1,5 @@
-
 import numpy as np
+import time
 
 TRAPPED = 0
 ADVANCED = 1
@@ -163,6 +163,7 @@ def rrt_connect_plan(
         enable_shortcut=True,
         shortcut_edge_resolution=None,
         shortcut_max_passes=None,
+        deadline_s=None,
 ):
     """
     Runs RRT-connect from start and goal, then optionally short-cuts the resulting
@@ -204,6 +205,8 @@ def rrt_connect_plan(
         return q
 
     for iter in range(max_iters):
+        if deadline_s is not None and time.perf_counter() > float(deadline_s):
+            raise TimeoutError("RRT-Connect timed out before finding a path.")
 
         # Sample and reject samples that are in collision
         q_rand = None

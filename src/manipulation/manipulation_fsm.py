@@ -1,5 +1,6 @@
 import dataclasses as dc
 import enum
+import time
 import typing
 
 import numpy as np
@@ -25,15 +26,22 @@ class ManipulationOptions:
     """
     Task-level options for pick-and-place planning.
     """
-    position_tol: float = 0.001
+    position_tol: float = 0.002
     theta_tol: float = 0.035
     ik_soft_starts: int = 20
     ik_soft_start_sigma: float = 0.08
     ik_soft_start_seed: int = 0
-    rrt_step_size: float = 0.12
+    rrt_step_size: float = 0.35
     rrt_goal_sample_rate: float = 0.20
     rrt_max_iters: int = 50_000
     rrt_edge_resolution: float = 0.005
+    max_planning_time_s: float | None = 60.0
+    drop_rrt_step_size: float | None = 0.45
+    drop_rrt_goal_sample_rate: float | None = 0.35
+    drop_rrt_max_iters: int | None = 12_000
+    drop_rrt_edge_resolution: float | None = 0.01
+    drop_rrt_time_budget_s: float | None = 8.0
+    max_drop_candidates: int | None = 20
     drop_xy_offsets_m: tuple[tuple[float, float], ...] = (
         (0.0, 0.0),
         (0.03, 0.0),
@@ -67,6 +75,7 @@ class ManipulationResult:
     plan: ManipulationPlan | None
     error_message: str | None
     transition_history: list[ManipulationState]
+    timings_s: dict[str, float] = dc.field(default_factory=dict)
 
 
 class ManipulationFSM:
@@ -85,6 +94,7 @@ class ManipulationFSM:
         joints_lower_limits: np.ndarray,
         joints_upper_limits: np.ndarray,
         is_free_grasp: typing.Callable[[np.ndarray], bool] | None = None,
+        is_free_deapproach: typing.Callable[[np.ndarray], bool] | None = None,
         is_free_carry: typing.Callable[[np.ndarray], bool] | None = None,
         q_wsg_carry: np.ndarray | None = None,
         carry_payload_instance=None,
@@ -98,6 +108,7 @@ class ManipulationFSM:
         self.is_free = is_free
         self.is_free_grasp = is_free_grasp or is_free
         self.is_free_carry = is_free_carry or self.is_free_grasp
+        self.is_free_deapproach = is_free_deapproach or self.is_free_carry
         self.q_wsg_carry = None if q_wsg_carry is None else np.asarray(q_wsg_carry, dtype=float).copy()
         self.carry_payload_instance = carry_payload_instance
         self.carry_payload_carrier_frame_name = str(carry_payload_carrier_frame_name)
@@ -112,8 +123,20 @@ class ManipulationFSM:
     def _configure_carry_payload_attachment(self, q_grasp: np.ndarray) -> None:
         if self.carry_payload_instance is None:
             return
-        configure_fn = getattr(self.is_free_carry, "configure_attached_model", None)
-        if not callable(configure_fn):
+
+        configure_fns: list[typing.Callable[..., None]] = []
+        seen = set()
+        for checker in (self.is_free_deapproach, self.is_free_carry):
+            if checker is None:
+                continue
+            checker_id = id(checker)
+            if checker_id in seen:
+                continue
+            seen.add(checker_id)
+            configure_fn = getattr(checker, "configure_attached_model", None)
+            if callable(configure_fn):
+                configure_fns.append(configure_fn)
+        if not configure_fns:
             return
 
         ctx = self.root_context_current.Clone()
@@ -146,17 +169,23 @@ class ManipulationFSM:
             plant_context, self.plant.world_frame(), payload_body.body_frame()
         )
         X_CB = X_WC.inverse() @ X_WB
-        configure_fn(
-            model_instance=self.carry_payload_instance,
-            carrier_frame=carrier_frame,
-            X_CB=X_CB,
-        )
+        for configure_fn in configure_fns:
+            configure_fn(
+                model_instance=self.carry_payload_instance,
+                carrier_frame=carrier_frame,
+                X_CB=X_CB,
+            )
 
     def _plan_rrt(
         self,
         q_start: np.ndarray,
         q_goal: np.ndarray,
         is_free_fn: typing.Callable[[np.ndarray], bool] | None = None,
+        planning_deadline_s: float | None = None,
+        step_size: float | None = None,
+        goal_sample_rate: float | None = None,
+        max_iters: int | None = None,
+        edge_resolution: float | None = None,
     ) -> list[np.ndarray]:
         is_free_fn = is_free_fn or self.is_free
         return rrt_connect_plan(
@@ -165,11 +194,18 @@ class ManipulationFSM:
             is_free=is_free_fn,
             joints_lower_limits=self.joints_lower_limits,
             joints_upper_limits=self.joints_upper_limits,
-            step_size=self.options.rrt_step_size,
-            goal_sample_rate=self.options.rrt_goal_sample_rate,
-            max_iters=self.options.rrt_max_iters,
-            edge_resolution=self.options.rrt_edge_resolution,
+            step_size=self.options.rrt_step_size if step_size is None else float(step_size),
+            goal_sample_rate=(
+                self.options.rrt_goal_sample_rate
+                if goal_sample_rate is None else float(goal_sample_rate)
+            ),
+            max_iters=self.options.rrt_max_iters if max_iters is None else int(max_iters),
+            edge_resolution=(
+                self.options.rrt_edge_resolution
+                if edge_resolution is None else float(edge_resolution)
+            ),
             enable_shortcut=True,
+            deadline_s=planning_deadline_s,
         )
 
     def _iter_drop_candidates(self, X_WG_drop: RigidTransform):
@@ -196,11 +232,23 @@ class ManipulationFSM:
         X_WG_drop: RigidTransform,
     ) -> ManipulationResult:
         self._history = []
+        timings_s: dict[str, float] = {}
+        planning_start = time.perf_counter()
+        planning_deadline_s = None
+        if self.options.max_planning_time_s is not None:
+            planning_deadline_s = planning_start + float(self.options.max_planning_time_s)
+
+        def _check_planning_deadline() -> None:
+            if planning_deadline_s is not None and time.perf_counter() > planning_deadline_s:
+                raise TimeoutError(f"Planning exceeded time budget of {self.options.max_planning_time_s:.1f}s")
+
         q_home = np.asarray(q_home, dtype=float).reshape(7)
         self._transition(ManipulationState.HOME_READY)
 
         try:
             self._transition(ManipulationState.PLAN_HOME_TO_PREGRASP)
+            phase_start = time.perf_counter()
+            _check_planning_deadline()
             q_pregrasp = solve_iiwa_ik_for_gripper_pose(
                 plant=self.plant,
                 root_context_current=self.root_context_current,
@@ -216,9 +264,14 @@ class ManipulationFSM:
             )
             if not self.is_free(q_pregrasp):
                 raise RuntimeError("Pregrasp IK solution is not collision free")
-            path_home_to_pregrasp = self._plan_rrt(q_home, q_pregrasp)
+            path_home_to_pregrasp = self._plan_rrt(
+                q_home, q_pregrasp, planning_deadline_s=planning_deadline_s
+            )
+            timings_s["plan_home_to_pregrasp"] = time.perf_counter() - phase_start
 
             self._transition(ManipulationState.RUN_GRASP_PRIMITIVE)
+            phase_start = time.perf_counter()
+            _check_planning_deadline()
             grasp_result = plan_grasp_primitive(
                 plant=self.plant,
                 root_context_current=self.root_context_current,
@@ -230,7 +283,11 @@ class ManipulationFSM:
                 q_pregrasp=q_pregrasp,
                 X_WG_pregrasp=X_WG_pregrasp,
                 options=self.options.grasp_options,
+                is_free_retreat=self.is_free_deapproach,
+                prepare_retreat_checker=self._configure_carry_payload_attachment,
+                planning_deadline_s=planning_deadline_s,
             )
+            timings_s["plan_grasp_primitive"] = time.perf_counter() - phase_start
             if not grasp_result.success or grasp_result.plan is None:
                 details = "; ".join(grasp_result.failure_reasons)
                 raise RuntimeError(f"Grasp primitive failed. {details}")
@@ -240,12 +297,21 @@ class ManipulationFSM:
             self._configure_carry_payload_attachment(grasp_plan.q_grasp)
 
             self._transition(ManipulationState.PLAN_PREGRASP_TO_DROP)
+            phase_start = time.perf_counter()
             q_drop = None
             path_pregrasp_to_drop = None
             drop_candidate_index = -1
             X_WG_drop_selected = None
             drop_failures = []
+            drop_candidates_tried = 0
             for candidate_index, X_WG_drop_candidate in self._iter_drop_candidates(X_WG_drop):
+                _check_planning_deadline()
+                if (
+                    self.options.max_drop_candidates is not None
+                    and drop_candidates_tried >= int(self.options.max_drop_candidates)
+                ):
+                    break
+                drop_candidates_tried += 1
                 try:
                     q_drop_candidate = solve_iiwa_ik_for_gripper_pose(
                         plant=self.plant,
@@ -253,7 +319,7 @@ class ManipulationFSM:
                         iiwa_instance=self.iiwa_instance,
                         wsg_instance=self.wsg_instance,
                         desired_end_effector=X_WG_drop_candidate,
-                        q_iiwa_seed=grasp_plan.q_pregrasp,
+                        q_iiwa_seed=grasp_plan.q_postgrasp_retreat,
                         position_tol=self.options.position_tol,
                         theta_tol=self.options.theta_tol,
                         max_soft_starts=self.options.ik_soft_starts,
@@ -265,25 +331,42 @@ class ManipulationFSM:
                             f"drop_candidate_{candidate_index}: IK solution not collision free for carry state"
                         )
                         continue
+                    candidate_deadline_s = planning_deadline_s
+                    if self.options.drop_rrt_time_budget_s is not None:
+                        local_deadline_s = time.perf_counter() + float(self.options.drop_rrt_time_budget_s)
+                        if candidate_deadline_s is None:
+                            candidate_deadline_s = local_deadline_s
+                        else:
+                            candidate_deadline_s = min(candidate_deadline_s, local_deadline_s)
                     path_candidate = self._plan_rrt(
-                        grasp_plan.q_pregrasp,
+                        grasp_plan.q_postgrasp_retreat,
                         q_drop_candidate,
                         is_free_fn=self.is_free_carry,
+                        planning_deadline_s=candidate_deadline_s,
+                        step_size=self.options.drop_rrt_step_size,
+                        goal_sample_rate=self.options.drop_rrt_goal_sample_rate,
+                        max_iters=self.options.drop_rrt_max_iters,
+                        edge_resolution=self.options.drop_rrt_edge_resolution,
                     )
                     q_drop = np.asarray(q_drop_candidate, dtype=float).copy()
                     path_pregrasp_to_drop = path_candidate
                     drop_candidate_index = candidate_index
                     X_WG_drop_selected = X_WG_drop_candidate
                     break
+                except TimeoutError:
+                    drop_failures.append(f"drop_candidate_{candidate_index}: RRT timeout")
                 except Exception as exc:
                     drop_failures.append(f"drop_candidate_{candidate_index}: {exc}")
 
+            timings_s["plan_pregrasp_to_drop"] = time.perf_counter() - phase_start
+            timings_s["drop_candidates_tried"] = float(drop_candidates_tried)
             if q_drop is None or path_pregrasp_to_drop is None or X_WG_drop_selected is None:
                 details = "; ".join(drop_failures)
                 raise RuntimeError(f"Drop planning failed. {details}")
 
             self._transition(ManipulationState.RELEASE_AT_DROP)
             self._transition(ManipulationState.DONE)
+            timings_s["plan_total"] = time.perf_counter() - planning_start
             return ManipulationResult(
                 success=True,
                 final_state=ManipulationState.DONE,
@@ -306,13 +389,16 @@ class ManipulationFSM:
                 ),
                 error_message=None,
                 transition_history=self._history.copy(),
+                timings_s=timings_s.copy(),
             )
         except Exception as exc:
             self._transition(ManipulationState.FAILED)
+            timings_s["plan_total"] = time.perf_counter() - planning_start
             return ManipulationResult(
                 success=False,
                 final_state=ManipulationState.FAILED,
                 plan=None,
                 error_message=str(exc),
                 transition_history=self._history.copy(),
+                timings_s=timings_s.copy(),
             )
