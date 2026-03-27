@@ -6,7 +6,7 @@ import numpy as np
 from pydrake.math import RigidTransform, RollPitchYaw, RotationMatrix
 
 from src.planning.IK import solve_iiwa_ik_for_gripper_pose
-from src.planning.rrt_connect import rrt_connect_plan
+from src.planning.rrt_connect import AdaptiveStepConfig, rrt_connect_plan
 
 
 @dc.dataclass(frozen=True)
@@ -34,6 +34,19 @@ class GraspOptions:
     rrt_goal_sample_rate: float = 0.20
     rrt_max_iters: int = 50000
     rrt_edge_resolution: float = 0.03
+    rrt_adaptive_step: AdaptiveStepConfig = dc.field(
+        default_factory=lambda: AdaptiveStepConfig(
+            enabled=True,
+            min_step_size=0.03,
+            clearance_gain=12.0,
+            max_backoff_trials=4,
+            backoff_factor=0.5,
+            success_growth_factor=1.04,
+            failure_shrink_factor=0.7,
+            tree_scale_min=0.5,
+            tree_scale_max=1.8,
+        )
+    )
     # Prefer a Cartesian straight-line insertion from pregrasp to grasp.
     approach_prefer_straight_line: bool = True
     approach_linear_step_m: float = 0.01
@@ -116,6 +129,7 @@ def _plan_rrt_segment(
         edge_resolution=options.rrt_edge_resolution,
         enable_shortcut=False,
         deadline_s=planning_deadline_s,
+        adaptive_step_config=options.rrt_adaptive_step,
     )
 
 

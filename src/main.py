@@ -261,7 +261,7 @@ def main():
             # Top Shelf -> [0.0, 0.15, 0.56]
             X_WB = RigidTransform(
                 RollPitchYaw(0.0, 0.0, math.radians(-90.0)).ToRotationMatrix(),
-                [0.0, 0.15, 0.30],
+                [0.0, 0.15, 0.030],
             )
             sim_plant.SetFreeBodyPose(plant_context, brick_body, X_WB)
     else:
@@ -373,9 +373,11 @@ def main():
         ik_soft_start_seed=0,
         max_planning_time_s=600.0,
         # Fast drop-stage settings to avoid multi-minute planning tails.
+        # in radians b/c in joint space
         drop_rrt_step_size=0.95,
         drop_rrt_goal_sample_rate=0.35,
         drop_rrt_max_iters=12_000,
+        # in radians as well -> check every 0.03 radians on 0.95 radian vector
         drop_rrt_edge_resolution=0.03,
         drop_rrt_time_budget_s=400.0,
         max_drop_candidates=20,

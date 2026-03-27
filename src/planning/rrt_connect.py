@@ -1,3 +1,4 @@
+import dataclasses as dc
 import numpy as np
 import time
 
@@ -6,10 +7,33 @@ ADVANCED = 1
 REACHED = 2
 
 
+@dc.dataclass(frozen=True)
+class AdaptiveStepConfig:
+    """
+    Online step-size adaptation for RRT-Connect tree expansion.
+
+    `min_step_size` and `max_step_size` are in joint-space radians.
+    `clearance_gain` maps clearance margin in meters to an additional joint-space
+    step budget. The result is clipped into `[min_step_size, max_step_size]`.
+    """
+    enabled: bool = True
+    min_step_size: float = 0.05
+    max_step_size: float | None = None
+    clearance_gain: float = 15.0
+    max_backoff_trials: int = 3
+    backoff_factor: float = 0.5
+    success_growth_factor: float = 1.05
+    failure_shrink_factor: float = 0.7
+    tree_scale_min: float = 0.5
+    tree_scale_max: float = 2.0
+
+
 class Tree:
     def __init__(self, q_root):
         self.nodes = [np.asarray(q_root, dtype=float).copy()]
         self.parent = [-1]
+        self.step_scale = 1.0
+        self.node_clearance = [None]
 
 def find_nearest_node(nodes, q):
     """
@@ -99,7 +123,79 @@ def trace_path(tree: Tree, idx: int):
     path.reverse()
     return path
 
-def extend_tree(tree: Tree, q_target, is_free, step_size, edge_resolution, joints_lower_limits, joints_upper_limits):
+def _clip_step_scale(tree: Tree, config: AdaptiveStepConfig):
+    tree.step_scale = float(
+        np.clip(tree.step_scale, config.tree_scale_min, config.tree_scale_max)
+    )
+
+def _resolve_step_bounds(step_size, adaptive_step_config: AdaptiveStepConfig | None):
+    if adaptive_step_config is None or not adaptive_step_config.enabled:
+        nominal_step_size = float(step_size)
+        return nominal_step_size, nominal_step_size
+
+    min_step_size = max(1e-6, float(adaptive_step_config.min_step_size))
+    max_step_size = (
+        float(step_size)
+        if adaptive_step_config.max_step_size is None else float(adaptive_step_config.max_step_size)
+    )
+    if max_step_size < min_step_size:
+        max_step_size = min_step_size
+    return min_step_size, max_step_size
+
+def _lookup_clearance_estimate(
+    tree: Tree,
+    node_index: int,
+    q_node,
+    is_free,
+):
+    cached_clearance = tree.node_clearance[node_index]
+    if cached_clearance is not None:
+        return float(cached_clearance)
+
+    estimate_clearance = getattr(is_free, "estimate_clearance", None)
+    if not callable(estimate_clearance):
+        return None
+
+    clearance = float(estimate_clearance(q_node))
+    if np.isfinite(clearance):
+        tree.node_clearance[node_index] = clearance
+        return clearance
+    return None
+
+def _compute_adaptive_step_size(
+    tree: Tree,
+    q_near,
+    node_index,
+    is_free,
+    step_size,
+    adaptive_step_config: AdaptiveStepConfig | None,
+    use_clearance_estimate: bool,
+):
+    min_step_size, max_step_size = _resolve_step_bounds(step_size, adaptive_step_config)
+    if adaptive_step_config is None or not adaptive_step_config.enabled:
+        return max_step_size
+
+    local_step_size = max_step_size
+    if use_clearance_estimate:
+        clearance = _lookup_clearance_estimate(tree, node_index, q_near, is_free)
+        if clearance is not None:
+            min_clearance = float(getattr(is_free, "minimum_clearance", 0.0))
+            clearance_margin = max(0.0, clearance - min_clearance)
+            local_step_size = min_step_size + float(adaptive_step_config.clearance_gain) * clearance_margin
+
+    local_step_size *= float(tree.step_scale)
+    return float(np.clip(local_step_size, min_step_size, max_step_size))
+
+def extend_tree(
+    tree: Tree,
+    q_target,
+    is_free,
+    step_size,
+    edge_resolution,
+    joints_lower_limits,
+    joints_upper_limits,
+    adaptive_step_config: AdaptiveStepConfig | None = None,
+):
     """
     Try to extend tree by one step toward q_target.
     Returns (status, new_index_or_None).
@@ -109,25 +205,77 @@ def extend_tree(tree: Tree, q_target, is_free, step_size, edge_resolution, joint
     index_near = find_nearest_node(tree.nodes, q_target)
     q_near = tree.nodes[index_near]
 
-    q_new = find_new_node(q_near, q_target, step_size)
-    q_new = np.clip(q_new, joints_lower_limits, joints_upper_limits)
+    candidate_step_size = _compute_adaptive_step_size(
+        tree,
+        q_near,
+        index_near,
+        is_free,
+        step_size,
+        adaptive_step_config,
+        use_clearance_estimate=(tree.node_clearance[index_near] is not None),
+    )
+    attempt_count = 1
+    if adaptive_step_config is not None and adaptive_step_config.enabled:
+        attempt_count = max(1, int(adaptive_step_config.max_backoff_trials) + 1)
 
-    # Edge collision check (includes endpoints)
-    if not edge_is_free(is_free, q_near, q_new, resolution=edge_resolution):
-        return TRAPPED, None
+    q_new = None
+    for attempt_idx in range(attempt_count):
+        q_new = find_new_node(q_near, q_target, candidate_step_size)
+        q_new = np.clip(q_new, joints_lower_limits, joints_upper_limits)
 
-    tree.nodes.append(q_new)
-    tree.parent.append(index_near)
-    new_idx = len(tree.nodes) - 1
+        if np.linalg.norm(q_new - q_near) <= 1e-12:
+            break
+        if edge_is_free(is_free, q_near, q_new, resolution=edge_resolution):
+            tree.nodes.append(q_new)
+            tree.parent.append(index_near)
+            tree.node_clearance.append(None)
+            new_idx = len(tree.nodes) - 1
 
-    # REACHED if we landed exactly on the target
-    if np.linalg.norm(q_new - q_target) < 1e-8:
-        return REACHED, new_idx
+            if adaptive_step_config is not None and adaptive_step_config.enabled:
+                tree.step_scale *= float(adaptive_step_config.success_growth_factor)
+                _clip_step_scale(tree, adaptive_step_config)
 
-    # otherwise, continue to build tree and return ADVANCED
-    return ADVANCED, new_idx
+            # REACHED if we landed exactly on the target
+            if np.linalg.norm(q_new - q_target) < 1e-8:
+                return REACHED, new_idx
+            return ADVANCED, new_idx
 
-def connect(tree: Tree, q_target, is_free, step_size, edge_resolution, joints_lower_limits, joints_upper_limits, max_connect_steps=10_000):
+        if adaptive_step_config is None or not adaptive_step_config.enabled:
+            break
+        # Query clearance only after a failed aggressive attempt, then reuse it.
+        if attempt_idx == 0 and tree.node_clearance[index_near] is None:
+            clearance_step_size = _compute_adaptive_step_size(
+                tree,
+                q_near,
+                index_near,
+                is_free,
+                step_size,
+                adaptive_step_config,
+                use_clearance_estimate=True,
+            )
+            candidate_step_size = min(candidate_step_size, clearance_step_size)
+        candidate_step_size *= float(adaptive_step_config.backoff_factor)
+        min_step_size, _ = _resolve_step_bounds(step_size, adaptive_step_config)
+        if candidate_step_size < min_step_size:
+            candidate_step_size = min_step_size
+
+    if adaptive_step_config is not None and adaptive_step_config.enabled:
+        tree.step_scale *= float(adaptive_step_config.failure_shrink_factor)
+        _clip_step_scale(tree, adaptive_step_config)
+
+    return TRAPPED, None
+
+def connect(
+    tree: Tree,
+    q_target,
+    is_free,
+    step_size,
+    edge_resolution,
+    joints_lower_limits,
+    joints_upper_limits,
+    max_connect_steps=10_000,
+    adaptive_step_config: AdaptiveStepConfig | None = None,
+):
     """
     Greedily extend tree toward q_target until TRAPPED or REACHED.
     Returns (status, last_index or None if failed).
@@ -136,7 +284,8 @@ def connect(tree: Tree, q_target, is_free, step_size, edge_resolution, joints_lo
     for i in range(max_connect_steps):
         status, index = extend_tree(
             tree, q_target, is_free, step_size, edge_resolution,
-            joints_lower_limits, joints_upper_limits
+            joints_lower_limits, joints_upper_limits,
+            adaptive_step_config=adaptive_step_config,
         )
 
         last_index = index
@@ -164,6 +313,7 @@ def rrt_connect_plan(
         shortcut_edge_resolution=None,
         shortcut_max_passes=None,
         deadline_s=None,
+        adaptive_step_config: AdaptiveStepConfig | None = None,
 ):
     """
     Runs RRT-connect from start and goal, then optionally short-cuts the resulting
@@ -221,14 +371,18 @@ def rrt_connect_plan(
         # Extend active tree one step toward sample
         status_start_branch, idx_start_branch = extend_tree(
             T_start, q_rand, is_free, step_size, edge_resolution,
-            joints_lower_limits, joints_upper_limits
+            joints_lower_limits, joints_upper_limits,
+            adaptive_step_config=adaptive_step_config,
         )
         if status_start_branch != TRAPPED:
             q_new = T_start.nodes[idx_start_branch]
 
             # Greedily connect the other tree toward the new node
             status_goal_branch, idx_goal_branch = connect(
-                T_goal, q_new, is_free, step_size, edge_resolution, joints_lower_limits, joints_upper_limits, max_connect_steps=max_connect_steps
+                T_goal, q_new, is_free, step_size, edge_resolution,
+                joints_lower_limits, joints_upper_limits,
+                max_connect_steps=max_connect_steps,
+                adaptive_step_config=adaptive_step_config,
             )
 
             if status_goal_branch == REACHED:

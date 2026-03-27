@@ -99,7 +99,7 @@ def is_collision_free(
         attached_model["carrier_frame"] = None
         attached_model["X_CB"] = None
 
-    def is_free(q_iiwa):
+    def _set_positions(q_iiwa):
         q_iiwa = np.asarray(q_iiwa).reshape((number_iiwa,))
         plant.SetPositions(plant_context, iiwa_instance, q_iiwa)
 
@@ -116,9 +116,7 @@ def is_collision_free(
             X_WB = X_WC @ attached_model["X_CB"]
             plant.SetFreeBodyPose(plant_context, attached_model["floating_body"], X_WB)
 
-        query = scene_graph.get_query_output_port().Eval(scene_graph_context)
-
-        # Fast penetration check for robot vs environment only
+    def _robot_env_penetrations(query):
         penetrations = query.ComputePointPairPenetration()
         robot_env_pens = []
         for pen in penetrations:
@@ -131,6 +129,54 @@ def is_collision_free(
                 if (pen.id_A in ignored_geom_ids) or (pen.id_B in ignored_geom_ids):
                     continue
                 robot_env_pens.append(pen)
+        return robot_env_pens
+
+    def _robot_env_min_signed_distance(query):
+        if not hasattr(query, "ComputeSignedDistancePairwiseClosestPoints"):
+            return None
+
+        pairs = query.ComputeSignedDistancePairwiseClosestPoints(pair_range)
+        min_d = float(pair_range)
+        found_pair = False
+        for p in pairs:
+            # similar to collision, only append clearance-collisions between objects a and b such that only
+            # object a XOR b is a robot
+            # we effectively check for clearance-collisions between robot and enviorment only because robot to robot
+            # and robot to enviorment was taking far too long.
+            a_robot = (p.id_A in robot_geom_ids)
+            b_robot = (p.id_B in robot_geom_ids)
+            if a_robot != b_robot:
+                if (p.id_A in ignored_geom_ids) or (p.id_B in ignored_geom_ids):
+                    continue
+                found_pair = True
+                if p.distance < min_d:
+                    # take note of the smallest robot to enviorment distance
+                    min_d = p.distance
+        if found_pair:
+            return float(min_d)
+        # No nearby pairs means the clearance exceeds pair_range.
+        return float(pair_range)
+
+    def estimate_clearance(q_iiwa):
+        _set_positions(q_iiwa)
+        query = scene_graph.get_query_output_port().Eval(scene_graph_context)
+
+        robot_env_pens = _robot_env_penetrations(query)
+        if robot_env_pens:
+            max_depth = max(float(pen.depth) for pen in robot_env_pens)
+            return -max_depth
+
+        min_distance = _robot_env_min_signed_distance(query)
+        if min_distance is not None:
+            return float(min_distance)
+        return float("inf")
+
+    def is_free(q_iiwa):
+        _set_positions(q_iiwa)
+        query = scene_graph.get_query_output_port().Eval(scene_graph_context)
+
+        # Fast penetration check for robot vs environment only
+        robot_env_pens = _robot_env_penetrations(query)
 
         if min_clearance <= 1e-12:
             if robot_env_pens:
@@ -139,29 +185,18 @@ def is_collision_free(
             return True
 
         # Clearance check for robot vs environment only
-        if hasattr(query, "ComputeSignedDistancePairwiseClosestPoints"):
-            # compute distance for closest pair of points
-            pairs = query.ComputeSignedDistancePairwiseClosestPoints(pair_range)
-            min_d = float("inf")
-            for p in pairs:
-                # similar to collision, only append clearance-collisions between objects a and b such that only
-                # object a XOR b is a robot
-                # we effectively check for clearance-collisions between robot and enviorment only because robot to robot
-                # and robot to enviorment was taking far too long.
-                a_robot = (p.id_A in robot_geom_ids)
-                b_robot = (p.id_B in robot_geom_ids)
-                if a_robot != b_robot:
-                    if (p.id_A in ignored_geom_ids) or (p.id_B in ignored_geom_ids):
-                        continue
-                    if p.distance < min_d:
-                        # take note of the smallest robot to enviorment distance
-                        min_d = p.distance
-                    if p.distance < float(min_clearance):
-                        # clearence violated so reject config
-                        return False
+        min_d = _robot_env_min_signed_distance(query)
+        if min_d is None:
             return True
+        if min_d < float(min_clearance):
+            # clearence violated so reject config
+            return False
+        return True
 
     is_free.configure_attached_model = configure_attached_model
     is_free.clear_attached_model = clear_attached_model
+    is_free.estimate_clearance = estimate_clearance
+    is_free.minimum_clearance = float(min_clearance)
+    is_free.pair_range = float(pair_range)
 
     return is_free
