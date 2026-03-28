@@ -36,6 +36,7 @@ from src.planning.collision import is_collision_free
 from src.manipulation.grasp import GraspOptions
 from src.manipulation.manipulation_fsm import ManipulationFSM, ManipulationOptions
 from src.manipulation.pregrasp import get_floating_body, compute_pregrasp_pose_for_brick
+from src.planning.rrt_connect import RRTConnectConfig
 
 
 @dc.dataclass
@@ -261,7 +262,7 @@ def main():
             # Top Shelf -> [0.0, 0.15, 0.56]
             X_WB = RigidTransform(
                 RollPitchYaw(0.0, 0.0, math.radians(-90.0)).ToRotationMatrix(),
-                [0.0, 0.15, 0.030],
+                [0.0, 0.15, 0.30],
             )
             sim_plant.SetFreeBodyPose(plant_context, brick_body, X_WB)
     else:
@@ -367,19 +368,14 @@ def main():
         retreat_offset_world_y_m=0.0,
         retreat_offset_world_z_m=0.015,
     )
+    shared_rrt_config = RRTConnectConfig()
     fsm_options = ManipulationOptions(
         ik_soft_starts=ik_soft_starts,
         ik_soft_start_sigma=0.08,
         ik_soft_start_seed=0,
         max_planning_time_s=600.0,
-        # Fast drop-stage settings to avoid multi-minute planning tails.
-        # in radians b/c in joint space
-        drop_rrt_step_size=0.95,
-        drop_rrt_goal_sample_rate=0.35,
-        drop_rrt_max_iters=12_000,
-        # in radians as well -> check every 0.03 radians on 0.95 radian vector
-        drop_rrt_edge_resolution=0.03,
-        drop_rrt_time_budget_s=400.0,
+        rrt=shared_rrt_config,
+        drop_candidate_time_budget_s=400.0,
         max_drop_candidates=20,
         grasp_options=grasp_options,
     )

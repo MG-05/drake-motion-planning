@@ -6,7 +6,7 @@ import numpy as np
 from pydrake.math import RigidTransform, RollPitchYaw, RotationMatrix
 
 from src.planning.IK import solve_iiwa_ik_for_gripper_pose
-from src.planning.rrt_connect import AdaptiveStepConfig, rrt_connect_plan
+from src.planning.rrt_connect import RRTConnectConfig, rrt_connect_plan
 
 
 @dc.dataclass(frozen=True)
@@ -30,23 +30,6 @@ class GraspOptions:
     ik_soft_starts: int = 16
     ik_soft_start_sigma: float = 0.08
     ik_soft_start_seed: int = 0
-    rrt_step_size: float = 0.20
-    rrt_goal_sample_rate: float = 0.20
-    rrt_max_iters: int = 50000
-    rrt_edge_resolution: float = 0.03
-    rrt_adaptive_step: AdaptiveStepConfig = dc.field(
-        default_factory=lambda: AdaptiveStepConfig(
-            enabled=True,
-            min_step_size=0.03,
-            clearance_gain=12.0,
-            max_backoff_trials=4,
-            backoff_factor=0.5,
-            success_growth_factor=1.04,
-            failure_shrink_factor=0.7,
-            tree_scale_min=0.5,
-            tree_scale_max=1.8,
-        )
-    )
     # Prefer a Cartesian straight-line insertion from pregrasp to grasp.
     approach_prefer_straight_line: bool = True
     approach_linear_step_m: float = 0.01
@@ -114,7 +97,7 @@ def _plan_rrt_segment(
     is_free: typing.Callable[[np.ndarray], bool],
     joints_lower_limits: np.ndarray,
     joints_upper_limits: np.ndarray,
-    options: GraspOptions,
+    planner_config: RRTConnectConfig,
     planning_deadline_s: float | None = None,
 ) -> list[np.ndarray]:
     return rrt_connect_plan(
@@ -123,13 +106,7 @@ def _plan_rrt_segment(
         is_free=is_free,
         joints_lower_limits=joints_lower_limits,
         joints_upper_limits=joints_upper_limits,
-        step_size=options.rrt_step_size,
-        goal_sample_rate=options.rrt_goal_sample_rate,
-        max_iters=options.rrt_max_iters,
-        edge_resolution=options.rrt_edge_resolution,
-        enable_shortcut=False,
-        deadline_s=planning_deadline_s,
-        adaptive_step_config=options.rrt_adaptive_step,
+        **planner_config.to_plan_kwargs(deadline_s=planning_deadline_s),
     )
 
 
@@ -206,6 +183,7 @@ def plan_grasp_primitive(
     joints_upper_limits: np.ndarray,
     q_pregrasp: np.ndarray,
     X_WG_pregrasp: RigidTransform,
+    planner_config: RRTConnectConfig,
     options: GraspOptions | None = None,
     is_free_retreat: typing.Callable[[np.ndarray], bool] | None = None,
     prepare_retreat_checker: typing.Callable[[np.ndarray], None] | None = None,
@@ -276,7 +254,7 @@ def plan_grasp_primitive(
                             is_free=is_free,
                             joints_lower_limits=joints_lower_limits,
                             joints_upper_limits=joints_upper_limits,
-                            options=options,
+                            planner_config=planner_config,
                             planning_deadline_s=planning_deadline_s,
                         )
                     except Exception as rrt_exc:
@@ -291,7 +269,7 @@ def plan_grasp_primitive(
                     is_free=is_free,
                     joints_lower_limits=joints_lower_limits,
                     joints_upper_limits=joints_upper_limits,
-                    options=options,
+                    planner_config=planner_config,
                     planning_deadline_s=planning_deadline_s,
                 )
 
@@ -324,7 +302,7 @@ def plan_grasp_primitive(
                 is_free=is_free_retreat,
                 joints_lower_limits=joints_lower_limits,
                 joints_upper_limits=joints_upper_limits,
-                options=options,
+                planner_config=planner_config,
                 planning_deadline_s=planning_deadline_s,
             )
 

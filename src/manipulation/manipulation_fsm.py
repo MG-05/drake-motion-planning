@@ -8,7 +8,7 @@ from pydrake.math import RigidTransform, RollPitchYaw, RotationMatrix
 
 from src.manipulation.grasp import GraspOptions, GraspPrimitivePlan, plan_grasp_primitive
 from src.planning.IK import solve_iiwa_ik_for_gripper_pose
-from src.planning.rrt_connect import AdaptiveStepConfig, rrt_connect_plan
+from src.planning.rrt_connect import RRTConnectConfig, rrt_connect_plan
 
 
 class ManipulationState(str, enum.Enum):
@@ -31,42 +31,9 @@ class ManipulationOptions:
     ik_soft_starts: int = 20
     ik_soft_start_sigma: float = 0.08
     ik_soft_start_seed: int = 0
-    rrt_step_size: float = 0.35
-    rrt_goal_sample_rate: float = 0.20
-    rrt_max_iters: int = 50_000
-    rrt_edge_resolution: float = 0.005
-    rrt_adaptive_step: AdaptiveStepConfig = dc.field(
-        default_factory=lambda: AdaptiveStepConfig(
-            enabled=True,
-            min_step_size=0.05,
-            clearance_gain=15.0,
-            max_backoff_trials=4,
-            backoff_factor=0.5,
-            success_growth_factor=1.05,
-            failure_shrink_factor=0.7,
-            tree_scale_min=0.5,
-            tree_scale_max=2.0,
-        )
-    )
+    rrt: RRTConnectConfig = dc.field(default_factory=RRTConnectConfig)
     max_planning_time_s: float | None = 60.0
-    drop_rrt_step_size: float | None = 0.45
-    drop_rrt_goal_sample_rate: float | None = 0.35
-    drop_rrt_max_iters: int | None = 12_000
-    drop_rrt_edge_resolution: float | None = 0.01
-    drop_rrt_adaptive_step: AdaptiveStepConfig | None = dc.field(
-        default_factory=lambda: AdaptiveStepConfig(
-            enabled=True,
-            min_step_size=0.08,
-            clearance_gain=18.0,
-            max_backoff_trials=4,
-            backoff_factor=0.5,
-            success_growth_factor=1.06,
-            failure_shrink_factor=0.72,
-            tree_scale_min=0.5,
-            tree_scale_max=2.3,
-        )
-    )
-    drop_rrt_time_budget_s: float | None = 8.0
+    drop_candidate_time_budget_s: float | None = 8.0
     max_drop_candidates: int | None = 20
     drop_xy_offsets_m: tuple[tuple[float, float], ...] = (
         (0.0, 0.0),
@@ -208,11 +175,6 @@ class ManipulationFSM:
         q_goal: np.ndarray,
         is_free_fn: typing.Callable[[np.ndarray], bool] | None = None,
         planning_deadline_s: float | None = None,
-        step_size: float | None = None,
-        goal_sample_rate: float | None = None,
-        max_iters: int | None = None,
-        edge_resolution: float | None = None,
-        adaptive_step_config: AdaptiveStepConfig | None = None,
     ) -> list[np.ndarray]:
         is_free_fn = is_free_fn or self.is_free
         return rrt_connect_plan(
@@ -221,22 +183,7 @@ class ManipulationFSM:
             is_free=is_free_fn,
             joints_lower_limits=self.joints_lower_limits,
             joints_upper_limits=self.joints_upper_limits,
-            step_size=self.options.rrt_step_size if step_size is None else float(step_size),
-            goal_sample_rate=(
-                self.options.rrt_goal_sample_rate
-                if goal_sample_rate is None else float(goal_sample_rate)
-            ),
-            max_iters=self.options.rrt_max_iters if max_iters is None else int(max_iters),
-            edge_resolution=(
-                self.options.rrt_edge_resolution
-                if edge_resolution is None else float(edge_resolution)
-            ),
-            enable_shortcut=True,
-            deadline_s=planning_deadline_s,
-            adaptive_step_config=(
-                self.options.rrt_adaptive_step
-                if adaptive_step_config is None else adaptive_step_config
-            ),
+            **self.options.rrt.to_plan_kwargs(deadline_s=planning_deadline_s),
         )
 
     def _iter_drop_candidates(self, X_WG_drop: RigidTransform):
@@ -313,6 +260,7 @@ class ManipulationFSM:
                 joints_upper_limits=self.joints_upper_limits,
                 q_pregrasp=q_pregrasp,
                 X_WG_pregrasp=X_WG_pregrasp,
+                planner_config=self.options.rrt,
                 options=self.options.grasp_options,
                 is_free_retreat=self.is_free_deapproach,
                 prepare_retreat_checker=self._configure_carry_payload_attachment,
@@ -363,8 +311,10 @@ class ManipulationFSM:
                         )
                         continue
                     candidate_deadline_s = planning_deadline_s
-                    if self.options.drop_rrt_time_budget_s is not None:
-                        local_deadline_s = time.perf_counter() + float(self.options.drop_rrt_time_budget_s)
+                    if self.options.drop_candidate_time_budget_s is not None:
+                        local_deadline_s = (
+                            time.perf_counter() + float(self.options.drop_candidate_time_budget_s)
+                        )
                         if candidate_deadline_s is None:
                             candidate_deadline_s = local_deadline_s
                         else:
@@ -374,11 +324,6 @@ class ManipulationFSM:
                         q_drop_candidate,
                         is_free_fn=self.is_free_carry,
                         planning_deadline_s=candidate_deadline_s,
-                        step_size=self.options.drop_rrt_step_size,
-                        goal_sample_rate=self.options.drop_rrt_goal_sample_rate,
-                        max_iters=self.options.drop_rrt_max_iters,
-                        edge_resolution=self.options.drop_rrt_edge_resolution,
-                        adaptive_step_config=self.options.drop_rrt_adaptive_step,
                     )
                     q_drop = np.asarray(q_drop_candidate, dtype=float).copy()
                     path_pregrasp_to_drop = path_candidate

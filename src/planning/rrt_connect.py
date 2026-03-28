@@ -15,6 +15,18 @@ class AdaptiveStepConfig:
     `min_step_size` and `max_step_size` are in joint-space radians.
     `clearance_gain` maps clearance margin in meters to an additional joint-space
     step budget. The result is clipped into `[min_step_size, max_step_size]`.
+
+    The persistent per-tree step scale is controlled by a smoothed success-rate
+    controller with Schmitt-trigger hysteresis:
+    - the tree enters "shrink" mode when the EMA falls below
+      `success_rate_lower_trigger`
+    - the tree enters "grow" mode when the EMA rises above
+      `success_rate_upper_trigger`
+    - between the two thresholds it keeps its previous mode
+
+    Scale updates are then applied only when the latest extension outcome agrees
+    with the active mode, which avoids the twitchiness of raw per-extension
+    success/failure scaling.
     """
     enabled: bool = True
     min_step_size: float = 0.05
@@ -22,18 +34,86 @@ class AdaptiveStepConfig:
     clearance_gain: float = 15.0
     max_backoff_trials: int = 3
     backoff_factor: float = 0.5
-    success_growth_factor: float = 1.05
-    failure_shrink_factor: float = 0.7
+    success_rate_ema_alpha: float = 0.15
+    success_rate_lower_trigger: float = 0.35
+    success_rate_upper_trigger: float = 0.65
+    step_scale_growth_factor: float = 1.08
+    step_scale_shrink_factor: float = 0.88
+    initial_success_rate: float = 0.50
     tree_scale_min: float = 0.5
     tree_scale_max: float = 2.0
 
 
+@dc.dataclass(frozen=True)
+class RRTConnectConfig:
+    """
+    Shared configuration for all RRT-Connect calls in the manipulation stack.
+
+    The adaptive controller is the mechanism for handling clutter vs open space
+    online, so this profile should be reused across phases instead of tuning
+    separate stage-specific step sizes.
+    """
+    step_size: float = 0.7
+    goal_sample_rate: float = 0.25
+    line_sample_rate: float = 0.55
+    sigma_line: float = 0.20
+    max_iters: int = 50_000
+    edge_resolution: float = 0.03
+    max_sample_tries: int = 30
+    max_connect_steps: int = 1000
+    enable_shortcut: bool = True
+    shortcut_edge_resolution: float | None = None
+    shortcut_max_passes: int | None = None
+    adaptive_step_config: AdaptiveStepConfig = dc.field(
+        default_factory=lambda: AdaptiveStepConfig(
+            enabled=True,
+            min_step_size=0.03,
+            max_step_size=1.0,
+            clearance_gain=20.0,
+            max_backoff_trials=1,
+            backoff_factor=0.50,
+            success_rate_ema_alpha=0.13,
+            success_rate_lower_trigger=0.35,
+            success_rate_upper_trigger=0.70,
+            step_scale_growth_factor=1.13,
+            step_scale_shrink_factor=0.93,
+            initial_success_rate=0.50,
+            tree_scale_min=0.5,
+            tree_scale_max=3.0,
+        )
+    )
+
+    def to_plan_kwargs(self, *, deadline_s: float | None = None) -> dict[str, object]:
+        return {
+            "step_size": float(self.step_size),
+            "goal_sample_rate": float(self.goal_sample_rate),
+            "line_sample_rate": float(self.line_sample_rate),
+            "sigma_line": float(self.sigma_line),
+            "max_iters": int(self.max_iters),
+            "edge_resolution": float(self.edge_resolution),
+            "max_sample_tries": int(self.max_sample_tries),
+            "max_connect_steps": int(self.max_connect_steps),
+            "enable_shortcut": bool(self.enable_shortcut),
+            "shortcut_edge_resolution": self.shortcut_edge_resolution,
+            "shortcut_max_passes": self.shortcut_max_passes,
+            "deadline_s": deadline_s,
+            "adaptive_step_config": self.adaptive_step_config,
+        }
+
+
 class Tree:
-    def __init__(self, q_root):
+    def __init__(self, q_root, adaptive_step_config: AdaptiveStepConfig | None = None):
         self.nodes = [np.asarray(q_root, dtype=float).copy()]
         self.parent = [-1]
         self.step_scale = 1.0
         self.node_clearance = [None]
+        if adaptive_step_config is None or not adaptive_step_config.enabled:
+            self.success_rate_ema = 0.5
+        else:
+            self.success_rate_ema = float(
+                np.clip(adaptive_step_config.initial_success_rate, 0.0, 1.0)
+            )
+        self.step_scale_control_mode: str | None = None
 
 def find_nearest_node(nodes, q):
     """
@@ -128,6 +208,27 @@ def _clip_step_scale(tree: Tree, config: AdaptiveStepConfig):
         np.clip(tree.step_scale, config.tree_scale_min, config.tree_scale_max)
     )
 
+def _validate_adaptive_step_config(config: AdaptiveStepConfig | None):
+    if config is None or not config.enabled:
+        return
+
+    if not (0.0 < float(config.success_rate_ema_alpha) <= 1.0):
+        raise ValueError("success_rate_ema_alpha must lie in (0, 1].")
+    if not (0.0 <= float(config.initial_success_rate) <= 1.0):
+        raise ValueError("initial_success_rate must lie in [0, 1].")
+
+    lower = float(config.success_rate_lower_trigger)
+    upper = float(config.success_rate_upper_trigger)
+    if not (0.0 <= lower < upper <= 1.0):
+        raise ValueError(
+            "success_rate_lower_trigger and success_rate_upper_trigger must satisfy "
+            "0 <= lower < upper <= 1."
+        )
+    if float(config.step_scale_growth_factor) < 1.0:
+        raise ValueError("step_scale_growth_factor must be at least 1.0.")
+    if not (0.0 < float(config.step_scale_shrink_factor) <= 1.0):
+        raise ValueError("step_scale_shrink_factor must lie in (0, 1].")
+
 def _resolve_step_bounds(step_size, adaptive_step_config: AdaptiveStepConfig | None):
     if adaptive_step_config is None or not adaptive_step_config.enabled:
         nominal_step_size = float(step_size)
@@ -161,6 +262,37 @@ def _lookup_clearance_estimate(
         tree.node_clearance[node_index] = clearance
         return clearance
     return None
+
+def _update_step_scale_controller(
+    tree: Tree,
+    adaptive_step_config: AdaptiveStepConfig | None,
+    extension_succeeded: bool,
+):
+    if adaptive_step_config is None or not adaptive_step_config.enabled:
+        return
+
+    alpha = float(adaptive_step_config.success_rate_ema_alpha)
+    outcome = 1.0 if extension_succeeded else 0.0
+    tree.success_rate_ema = (
+        (1.0 - alpha) * float(tree.success_rate_ema)
+        + alpha * outcome
+    )
+
+    lower = float(adaptive_step_config.success_rate_lower_trigger)
+    upper = float(adaptive_step_config.success_rate_upper_trigger)
+    if tree.success_rate_ema <= lower:
+        tree.step_scale_control_mode = "shrink"
+    elif tree.success_rate_ema >= upper:
+        tree.step_scale_control_mode = "grow"
+
+    if tree.step_scale_control_mode == "grow" and extension_succeeded:
+        tree.step_scale *= float(adaptive_step_config.step_scale_growth_factor)
+    elif tree.step_scale_control_mode == "shrink" and not extension_succeeded:
+        tree.step_scale *= float(adaptive_step_config.step_scale_shrink_factor)
+    else:
+        return
+
+    _clip_step_scale(tree, adaptive_step_config)
 
 def _compute_adaptive_step_size(
     tree: Tree,
@@ -231,9 +363,11 @@ def extend_tree(
             tree.node_clearance.append(None)
             new_idx = len(tree.nodes) - 1
 
-            if adaptive_step_config is not None and adaptive_step_config.enabled:
-                tree.step_scale *= float(adaptive_step_config.success_growth_factor)
-                _clip_step_scale(tree, adaptive_step_config)
+            _update_step_scale_controller(
+                tree,
+                adaptive_step_config,
+                extension_succeeded=True,
+            )
 
             # REACHED if we landed exactly on the target
             if np.linalg.norm(q_new - q_target) < 1e-8:
@@ -259,9 +393,11 @@ def extend_tree(
         if candidate_step_size < min_step_size:
             candidate_step_size = min_step_size
 
-    if adaptive_step_config is not None and adaptive_step_config.enabled:
-        tree.step_scale *= float(adaptive_step_config.failure_shrink_factor)
-        _clip_step_scale(tree, adaptive_step_config)
+    _update_step_scale_controller(
+        tree,
+        adaptive_step_config,
+        extension_succeeded=False,
+    )
 
     return TRAPPED, None
 
@@ -328,8 +464,10 @@ def rrt_connect_plan(
     joints_lower_limits = np.asarray(joints_lower_limits)
     joints_upper_limits = np.asarray(joints_upper_limits)
 
-    T_start = Tree(q_start)
-    T_goal = Tree(q_goal)
+    _validate_adaptive_step_config(adaptive_step_config)
+
+    T_start = Tree(q_start, adaptive_step_config=adaptive_step_config)
+    T_goal = Tree(q_goal, adaptive_step_config=adaptive_step_config)
 
     # check for feasibility:
     if not is_free(q_start):
