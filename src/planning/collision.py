@@ -116,6 +116,10 @@ def is_collision_free(
             X_WB = X_WC @ attached_model["X_CB"]
             plant.SetFreeBodyPose(plant_context, attached_model["floating_body"], X_WB)
 
+    def _eval_query(q_iiwa):
+        _set_positions(q_iiwa)
+        return scene_graph.get_query_output_port().Eval(scene_graph_context)
+
     def _robot_env_penetrations(query):
         penetrations = query.ComputePointPairPenetration()
         robot_env_pens = []
@@ -158,8 +162,7 @@ def is_collision_free(
         return float(pair_range)
 
     def estimate_clearance(q_iiwa):
-        _set_positions(q_iiwa)
-        query = scene_graph.get_query_output_port().Eval(scene_graph_context)
+        query = _eval_query(q_iiwa)
 
         robot_env_pens = _robot_env_penetrations(query)
         if robot_env_pens:
@@ -171,18 +174,20 @@ def is_collision_free(
             return float(min_distance)
         return float("inf")
 
+    def growth_is_free(q_iiwa):
+        query = _eval_query(q_iiwa)
+        robot_env_pens = _robot_env_penetrations(query)
+        return not robot_env_pens
+
     def is_free(q_iiwa):
-        _set_positions(q_iiwa)
-        query = scene_graph.get_query_output_port().Eval(scene_graph_context)
+        query = _eval_query(q_iiwa)
+        robot_env_pens = _robot_env_penetrations(query)
+        if min_clearance <= 1e-12:
+            return not robot_env_pens
 
         # Fast penetration check for robot vs environment only
-        robot_env_pens = _robot_env_penetrations(query)
-
-        if min_clearance <= 1e-12:
-            if robot_env_pens:
-                # fail if penetrates
-                return False
-            return True
+        if robot_env_pens:
+            return False
 
         # Clearance check for robot vs environment only
         min_d = _robot_env_min_signed_distance(query)
@@ -198,5 +203,12 @@ def is_collision_free(
     is_free.estimate_clearance = estimate_clearance
     is_free.minimum_clearance = float(min_clearance)
     is_free.pair_range = float(pair_range)
+    is_free.growth_is_free = growth_is_free
+
+    growth_is_free.configure_attached_model = configure_attached_model
+    growth_is_free.clear_attached_model = clear_attached_model
+    growth_is_free.minimum_clearance = 0.0
+    growth_is_free.pair_range = float(pair_range)
+    growth_is_free.strict_is_free = is_free
 
     return is_free

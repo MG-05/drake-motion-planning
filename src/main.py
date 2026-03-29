@@ -165,6 +165,11 @@ def _compute_wsg_planning_configs(q_wsg_open):
 
 def main():
     wall_start_total = time.perf_counter()
+    shelf_level_to_brick_position = {
+        "low": np.array([0.0, 0.15, 0.030]),
+        "mid": np.array([0.0, 0.15, 0.30]),
+        "high": np.array([0.0, 0.15, 0.56]),
+    }
 
     # sample parser arguments from source Drake code (slightly modified)
     parser = argparse.ArgumentParser(
@@ -174,17 +179,29 @@ def main():
     parser.add_argument("--scenario_name", type=str, default="StarterEnv")
     parser.add_argument("--duration", type=float, default=None, help="Override YAML simulation_duration.")
     parser.add_argument("--open", action="store_true", help="Open Meshcat in browser.")
+    parser.add_argument(
+        "--brick_shelf_level",
+        choices=tuple(shelf_level_to_brick_position.keys()),
+        default="mid",
+        help="Initial foam brick shelf height for planning benchmarks.",
+    )
+    parser.add_argument(
+        "--plan_only",
+        action="store_true",
+        help="Run planning only and skip trajectory execution.",
+    )
     args = parser.parse_args()
 
     if not args.scenario_file.exists():
         print(f"ERROR - Scenario file not found: {args.scenario_file}", file=sys.stderr)
         return 2
 
-    # Start Meshcat
-    meshcat = Meshcat()
-    print(f"[Meshcat] {meshcat.web_url()}")
-    if args.open:
-        webbrowser.open(meshcat.web_url())
+    meshcat = None
+    if not args.plan_only:
+        meshcat = Meshcat()
+        print(f"[Meshcat] {meshcat.web_url()}")
+        if args.open:
+            webbrowser.open(meshcat.web_url())
 
     # Load scenario from YAML (top-level key = scenario_name)
     scenario = yaml_load_typed(
@@ -225,14 +242,15 @@ def main():
     )
 
     # Visualization to Meshcat
-    ApplyVisualizationConfig(
-        config=scenario.visualization,
-        builder=builder,
-        lcm_buses=lcm_buses,
-        meshcat=meshcat,
-        plant=sim_plant,
-        scene_graph=scene_graph,
-    )
+    if meshcat is not None:
+        ApplyVisualizationConfig(
+            config=scenario.visualization,
+            builder=builder,
+            lcm_buses=lcm_buses,
+            meshcat=meshcat,
+            plant=sim_plant,
+            scene_graph=scene_graph,
+        )
 
     diagram = builder.Build()
 
@@ -262,7 +280,7 @@ def main():
             # Top Shelf -> [0.0, 0.15, 0.56]
             X_WB = RigidTransform(
                 RollPitchYaw(0.0, 0.0, math.radians(-90.0)).ToRotationMatrix(),
-                [0.0, 0.15, 0.30],
+                shelf_level_to_brick_position[args.brick_shelf_level],
             )
             sim_plant.SetFreeBodyPose(plant_context, brick_body, X_WB)
     else:
@@ -366,7 +384,7 @@ def main():
         # Keep y at 0 to avoid perturbing grasp variant selection too much.
         # Positive z lifts upward to reduce shelf scraping on retreat.
         retreat_offset_world_y_m=0.0,
-        retreat_offset_world_z_m=0.015,
+        retreat_offset_world_z_m=0.02,
     )
     shared_rrt_config = RRTConnectConfig()
     fsm_options = ManipulationOptions(
@@ -426,6 +444,10 @@ def main():
     print(f"selected grasp variant: {plan.grasp_plan.selected_variant_index}")
     print(f"selected grasp variant params: {plan.grasp_plan.selected_variant}")
     print(f"selected drop candidate: {plan.drop_candidate_index}")
+
+    if args.plan_only:
+        print(f"Plan-only wall time: {time.perf_counter() - wall_start_total:.3f}s")
+        return 0
 
     lcm_url = scenario.lcm_buses["default"].lcm_url
     lcm = DrakeLcm(lcm_url)
@@ -536,11 +558,12 @@ def main():
     print(f"  execution_total: {sum(execution_timings_s.values()):.3f}")
     print(f"End-to-end wall time: {time.perf_counter() - wall_start_total:.3f}s")
 
-    meshcat.StopRecording()
-    meshcat.PublishRecording()
-    meshcat.StaticHtml()
-    with open("rrt_connect.html", "w") as f:
-        f.write(meshcat.StaticHtml())
+    if meshcat is not None:
+        meshcat.StopRecording()
+        meshcat.PublishRecording()
+        meshcat.StaticHtml()
+        with open("rrt_connect.html", "w") as f:
+            f.write(meshcat.StaticHtml())
 
     return 0
 

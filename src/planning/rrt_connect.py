@@ -10,38 +10,36 @@ REACHED = 2
 @dc.dataclass(frozen=True)
 class AdaptiveStepConfig:
     """
-    Online step-size adaptation for RRT-Connect tree expansion.
+    Node-local adaptive control for RRT-Connect expansion.
 
-    `min_step_size` and `max_step_size` are in joint-space radians.
-    `clearance_gain` maps clearance margin in meters to an additional joint-space
-    step budget. The result is clipped into `[min_step_size, max_step_size]`.
-
-    The persistent per-tree step scale is controlled by a smoothed success-rate
-    controller with Schmitt-trigger hysteresis:
-    - the tree enters "shrink" mode when the EMA falls below
-      `success_rate_lower_trigger`
-    - the tree enters "grow" mode when the EMA rises above
-      `success_rate_upper_trigger`
-    - between the two thresholds it keeps its previous mode
-
-    Scale updates are then applied only when the latest extension outcome agrees
-    with the active mode, which avoids the twitchiness of raw per-extension
-    success/failure scaling.
+    The planner maintains a preferred step scale per node, shrinks that scale
+    immediately on failed extensions, and updates it toward the step size that
+    actually succeeded after any local backoff. Nodes that repeatedly fail also
+    attract fewer distant samples through a dynamic-domain style sampling
+    radius. Optional clearance queries are only triggered on trapped nodes and
+    cached as local step caps.
     """
     enabled: bool = True
     min_step_size: float = 0.05
     max_step_size: float | None = None
-    clearance_gain: float = 15.0
     max_backoff_trials: int = 3
-    backoff_factor: float = 0.5
-    success_rate_ema_alpha: float = 0.15
-    success_rate_lower_trigger: float = 0.35
-    success_rate_upper_trigger: float = 0.65
-    step_scale_growth_factor: float = 1.08
-    step_scale_shrink_factor: float = 0.88
-    initial_success_rate: float = 0.50
-    tree_scale_min: float = 0.5
-    tree_scale_max: float = 2.0
+    backoff_factor: float = 0.65
+    successful_step_ema_alpha: float = 0.35
+    step_scale_growth_factor: float = 1.05
+    step_scale_shrink_factor: float = 0.70
+    initial_node_scale: float = 0.80
+    node_scale_min: float = 0.20
+    node_scale_max: float = 1.25
+    min_connect_steps: int = 32
+    sample_domain_step_multiplier: float = 3.0
+    sample_domain_initial_scale: float = 1.0
+    sample_domain_growth_factor: float = 1.05
+    sample_domain_shrink_factor: float = 0.60
+    sample_domain_scale_min: float = 0.35
+    sample_domain_scale_max: float = 2.0
+    failure_node_sample_rate: float = 0.15
+    failure_node_sample_sigma_scale: float = 0.75
+    clearance_step_cap_gain: float = 18.0
 
 
 @dc.dataclass(frozen=True)
@@ -53,33 +51,42 @@ class RRTConnectConfig:
     online, so this profile should be reused across phases instead of tuning
     separate stage-specific step sizes.
     """
-    step_size: float = 0.7
-    goal_sample_rate: float = 0.25
-    line_sample_rate: float = 0.55
-    sigma_line: float = 0.20
+    step_size: float = 0.9
+    goal_sample_rate: float = 0.30
+    line_sample_rate: float = 0.20
+    sigma_line: float = 0.18
     max_iters: int = 50_000
-    edge_resolution: float = 0.03
+    edge_resolution: float = 0.07
     max_sample_tries: int = 30
-    max_connect_steps: int = 1000
-    enable_shortcut: bool = True
+    max_connect_steps: int = 250
+    enable_shortcut: bool = False
     shortcut_edge_resolution: float | None = None
-    shortcut_max_passes: int | None = None
+    shortcut_max_passes: int | None = 1
+    final_validation_edge_resolution: float | None = 0.03
+    random_seed: int | None = None
     adaptive_step_config: AdaptiveStepConfig = dc.field(
         default_factory=lambda: AdaptiveStepConfig(
             enabled=True,
-            min_step_size=0.03,
+            min_step_size=0.04,
             max_step_size=1.0,
-            clearance_gain=20.0,
-            max_backoff_trials=1,
-            backoff_factor=0.50,
-            success_rate_ema_alpha=0.13,
-            success_rate_lower_trigger=0.35,
-            success_rate_upper_trigger=0.70,
-            step_scale_growth_factor=1.13,
-            step_scale_shrink_factor=0.93,
-            initial_success_rate=0.50,
-            tree_scale_min=0.5,
-            tree_scale_max=3.0,
+            max_backoff_trials=3,
+            backoff_factor=0.65,
+            successful_step_ema_alpha=0.35,
+            step_scale_growth_factor=1.05,
+            step_scale_shrink_factor=0.70,
+            initial_node_scale=0.85,
+            node_scale_min=0.20,
+            node_scale_max=1.25,
+            min_connect_steps=24,
+            sample_domain_step_multiplier=3.0,
+            sample_domain_initial_scale=1.0,
+            sample_domain_growth_factor=1.05,
+            sample_domain_shrink_factor=0.60,
+            sample_domain_scale_min=0.35,
+            sample_domain_scale_max=2.0,
+            failure_node_sample_rate=0.15,
+            failure_node_sample_sigma_scale=0.75,
+            clearance_step_cap_gain=18.0,
         )
     )
 
@@ -96,7 +103,9 @@ class RRTConnectConfig:
             "enable_shortcut": bool(self.enable_shortcut),
             "shortcut_edge_resolution": self.shortcut_edge_resolution,
             "shortcut_max_passes": self.shortcut_max_passes,
+            "final_validation_edge_resolution": self.final_validation_edge_resolution,
             "deadline_s": deadline_s,
+            "random_seed": self.random_seed,
             "adaptive_step_config": self.adaptive_step_config,
         }
 
@@ -105,15 +114,28 @@ class Tree:
     def __init__(self, q_root, adaptive_step_config: AdaptiveStepConfig | None = None):
         self.nodes = [np.asarray(q_root, dtype=float).copy()]
         self.parent = [-1]
-        self.step_scale = 1.0
-        self.node_clearance = [None]
-        if adaptive_step_config is None or not adaptive_step_config.enabled:
-            self.success_rate_ema = 0.5
-        else:
-            self.success_rate_ema = float(
-                np.clip(adaptive_step_config.initial_success_rate, 0.0, 1.0)
+        initial_scale = 1.0
+        initial_sample_domain_scale = 1.0
+        if adaptive_step_config is not None and adaptive_step_config.enabled:
+            initial_scale = float(adaptive_step_config.initial_node_scale)
+            initial_scale = float(
+                np.clip(
+                    initial_scale,
+                    adaptive_step_config.node_scale_min,
+                    adaptive_step_config.node_scale_max,
+                )
             )
-        self.step_scale_control_mode: str | None = None
+            initial_sample_domain_scale = float(
+                np.clip(
+                    adaptive_step_config.sample_domain_initial_scale,
+                    adaptive_step_config.sample_domain_scale_min,
+                    adaptive_step_config.sample_domain_scale_max,
+                )
+            )
+        self.node_step_scales = [initial_scale]
+        self.node_sample_domain_scales = [initial_sample_domain_scale]
+        self.node_failure_counts = [0]
+        self.node_step_caps = [None]
 
 def find_nearest_node(nodes, q):
     """
@@ -137,9 +159,9 @@ def find_new_node(q_origin, q_dest, step_size):
 
     return q_origin + (step_size/dist) * v
 
-def edge_is_free(is_free, q0, q1, resolution=0.02):
+def edge_is_free(is_free, q0, q1, resolution=0.02, deadline_s: float | None = None):
     """
-    Checks if the sampled edge from q0 to q1 are collision free using L_\inf
+    Checks if the sampled edge from q0 to q1 are collision free using L_inf
     """
 
     dq = q1 - q0
@@ -148,9 +170,13 @@ def edge_is_free(is_free, q0, q1, resolution=0.02):
 
     # If very close, just check q1
     if n <= 1:
+        if deadline_s is not None and time.perf_counter() > float(deadline_s):
+            raise TimeoutError("RRT-Connect timed out before finding a path.")
         return bool(is_free(q1))
 
     for i in range(1, n + 1):
+        if deadline_s is not None and time.perf_counter() > float(deadline_s):
+            raise TimeoutError("RRT-Connect timed out before finding a path.")
         # start at config 1, skip q0
         a = i / n
         qi = (1 - a) * q0 + a * q1
@@ -159,7 +185,7 @@ def edge_is_free(is_free, q0, q1, resolution=0.02):
     return True
 
 
-def shortcut_path(path, is_free, edge_resolution=0.01, max_passes=None):
+def shortcut_path(path, is_free, edge_resolution=0.01, max_passes=None, deadline_s: float | None = None):
     """
     Repeatedly tries to replace path sub-sequences with straight joint-space edges.
     Stops when a full pass finds no valid shortcut, or max_passes is reached.
@@ -171,6 +197,8 @@ def shortcut_path(path, is_free, edge_resolution=0.01, max_passes=None):
 
     passes = 0
     while True:
+        if deadline_s is not None and time.perf_counter() > float(deadline_s):
+            raise TimeoutError("RRT-Connect timed out before finding a path.")
         if max_passes is not None and passes >= max_passes:
             break
 
@@ -181,7 +209,15 @@ def shortcut_path(path, is_free, edge_resolution=0.01, max_passes=None):
         for gap in range(n - 1, 1, -1):
             for i in range(0, n - gap):
                 j = i + gap
-                if edge_is_free(is_free, path[i], path[j], resolution=edge_resolution):
+                if deadline_s is not None and time.perf_counter() > float(deadline_s):
+                    raise TimeoutError("RRT-Connect timed out before finding a path.")
+                if edge_is_free(
+                    is_free,
+                    path[i],
+                    path[j],
+                    resolution=edge_resolution,
+                    deadline_s=deadline_s,
+                ):
                     path = path[: i + 1] + path[j:]
                     improved = True
                     break
@@ -203,31 +239,87 @@ def trace_path(tree: Tree, idx: int):
     path.reverse()
     return path
 
-def _clip_step_scale(tree: Tree, config: AdaptiveStepConfig):
-    tree.step_scale = float(
-        np.clip(tree.step_scale, config.tree_scale_min, config.tree_scale_max)
-    )
+def trace_path_with_root_index(tree: Tree, idx: int):
+    """Returns (path from root to idx, root_index)."""
+    path = []
+    root_index = idx
+    while idx != -1:
+        root_index = idx
+        path.append(tree.nodes[idx])
+        idx = tree.parent[idx]
+    path.reverse()
+    return path, root_index
+
+def append_tree_root(
+    tree: Tree,
+    q_root,
+):
+    tree.nodes.append(np.asarray(q_root, dtype=float).copy())
+    tree.parent.append(-1)
+    tree.node_step_scales.append(float(tree.node_step_scales[0]))
+    tree.node_sample_domain_scales.append(float(tree.node_sample_domain_scales[0]))
+    tree.node_failure_counts.append(0)
+    tree.node_step_caps.append(None)
+
+def _clip_node_step_scale(scale: float, config: AdaptiveStepConfig) -> float:
+    return float(np.clip(scale, config.node_scale_min, config.node_scale_max))
+
+def _clip_sample_domain_scale(scale: float, config: AdaptiveStepConfig) -> float:
+    return float(np.clip(scale, config.sample_domain_scale_min, config.sample_domain_scale_max))
 
 def _validate_adaptive_step_config(config: AdaptiveStepConfig | None):
     if config is None or not config.enabled:
         return
 
-    if not (0.0 < float(config.success_rate_ema_alpha) <= 1.0):
-        raise ValueError("success_rate_ema_alpha must lie in (0, 1].")
-    if not (0.0 <= float(config.initial_success_rate) <= 1.0):
-        raise ValueError("initial_success_rate must lie in [0, 1].")
-
-    lower = float(config.success_rate_lower_trigger)
-    upper = float(config.success_rate_upper_trigger)
-    if not (0.0 <= lower < upper <= 1.0):
-        raise ValueError(
-            "success_rate_lower_trigger and success_rate_upper_trigger must satisfy "
-            "0 <= lower < upper <= 1."
-        )
+    if int(config.max_backoff_trials) < 0:
+        raise ValueError("max_backoff_trials must be nonnegative.")
+    if not (0.0 < float(config.backoff_factor) <= 1.0):
+        raise ValueError("backoff_factor must lie in (0, 1].")
+    if not (0.0 < float(config.successful_step_ema_alpha) <= 1.0):
+        raise ValueError("successful_step_ema_alpha must lie in (0, 1].")
     if float(config.step_scale_growth_factor) < 1.0:
         raise ValueError("step_scale_growth_factor must be at least 1.0.")
     if not (0.0 < float(config.step_scale_shrink_factor) <= 1.0):
         raise ValueError("step_scale_shrink_factor must lie in (0, 1].")
+    if float(config.node_scale_min) <= 0.0:
+        raise ValueError("node_scale_min must be positive.")
+    if float(config.node_scale_max) < float(config.node_scale_min):
+        raise ValueError("node_scale_max must be at least node_scale_min.")
+    initial_node_scale = float(config.initial_node_scale)
+    if not (float(config.node_scale_min) <= initial_node_scale <= float(config.node_scale_max)):
+        raise ValueError(
+            "initial_node_scale must lie within [node_scale_min, node_scale_max]."
+        )
+    if int(config.min_connect_steps) <= 0:
+        raise ValueError("min_connect_steps must be positive.")
+    if float(config.sample_domain_step_multiplier) <= 0.0:
+        raise ValueError("sample_domain_step_multiplier must be positive.")
+    if float(config.sample_domain_growth_factor) < 1.0:
+        raise ValueError("sample_domain_growth_factor must be at least 1.0.")
+    if not (0.0 < float(config.sample_domain_shrink_factor) <= 1.0):
+        raise ValueError("sample_domain_shrink_factor must lie in (0, 1].")
+    if float(config.sample_domain_scale_min) <= 0.0:
+        raise ValueError("sample_domain_scale_min must be positive.")
+    if float(config.sample_domain_scale_max) < float(config.sample_domain_scale_min):
+        raise ValueError(
+            "sample_domain_scale_max must be at least sample_domain_scale_min."
+        )
+    initial_sample_domain_scale = float(config.sample_domain_initial_scale)
+    if not (
+        float(config.sample_domain_scale_min)
+        <= initial_sample_domain_scale
+        <= float(config.sample_domain_scale_max)
+    ):
+        raise ValueError(
+            "sample_domain_initial_scale must lie within "
+            "[sample_domain_scale_min, sample_domain_scale_max]."
+        )
+    if not (0.0 <= float(config.failure_node_sample_rate) <= 1.0):
+        raise ValueError("failure_node_sample_rate must lie in [0, 1].")
+    if float(config.failure_node_sample_sigma_scale) <= 0.0:
+        raise ValueError("failure_node_sample_sigma_scale must be positive.")
+    if float(config.clearance_step_cap_gain) < 0.0:
+        raise ValueError("clearance_step_cap_gain must be nonnegative.")
 
 def _resolve_step_bounds(step_size, adaptive_step_config: AdaptiveStepConfig | None):
     if adaptive_step_config is None or not adaptive_step_config.enabled:
@@ -243,80 +335,270 @@ def _resolve_step_bounds(step_size, adaptive_step_config: AdaptiveStepConfig | N
         max_step_size = min_step_size
     return min_step_size, max_step_size
 
-def _lookup_clearance_estimate(
+def _resolve_validation_resolution(
+    edge_resolution: float,
+    final_validation_edge_resolution: float | None,
+) -> float:
+    edge_resolution = max(1e-6, float(edge_resolution))
+    if final_validation_edge_resolution is None:
+        return edge_resolution
+    return min(edge_resolution, max(1e-6, float(final_validation_edge_resolution)))
+
+def _compute_node_step_size(
     tree: Tree,
     node_index: int,
-    q_node,
-    is_free,
-):
-    cached_clearance = tree.node_clearance[node_index]
-    if cached_clearance is not None:
-        return float(cached_clearance)
-
-    estimate_clearance = getattr(is_free, "estimate_clearance", None)
-    if not callable(estimate_clearance):
-        return None
-
-    clearance = float(estimate_clearance(q_node))
-    if np.isfinite(clearance):
-        tree.node_clearance[node_index] = clearance
-        return clearance
-    return None
-
-def _update_step_scale_controller(
-    tree: Tree,
+    step_size: float,
     adaptive_step_config: AdaptiveStepConfig | None,
-    extension_succeeded: bool,
-):
-    if adaptive_step_config is None or not adaptive_step_config.enabled:
-        return
-
-    alpha = float(adaptive_step_config.success_rate_ema_alpha)
-    outcome = 1.0 if extension_succeeded else 0.0
-    tree.success_rate_ema = (
-        (1.0 - alpha) * float(tree.success_rate_ema)
-        + alpha * outcome
-    )
-
-    lower = float(adaptive_step_config.success_rate_lower_trigger)
-    upper = float(adaptive_step_config.success_rate_upper_trigger)
-    if tree.success_rate_ema <= lower:
-        tree.step_scale_control_mode = "shrink"
-    elif tree.success_rate_ema >= upper:
-        tree.step_scale_control_mode = "grow"
-
-    if tree.step_scale_control_mode == "grow" and extension_succeeded:
-        tree.step_scale *= float(adaptive_step_config.step_scale_growth_factor)
-    elif tree.step_scale_control_mode == "shrink" and not extension_succeeded:
-        tree.step_scale *= float(adaptive_step_config.step_scale_shrink_factor)
-    else:
-        return
-
-    _clip_step_scale(tree, adaptive_step_config)
-
-def _compute_adaptive_step_size(
-    tree: Tree,
-    q_near,
-    node_index,
-    is_free,
-    step_size,
-    adaptive_step_config: AdaptiveStepConfig | None,
-    use_clearance_estimate: bool,
 ):
     min_step_size, max_step_size = _resolve_step_bounds(step_size, adaptive_step_config)
     if adaptive_step_config is None or not adaptive_step_config.enabled:
         return max_step_size
 
-    local_step_size = max_step_size
-    if use_clearance_estimate:
-        clearance = _lookup_clearance_estimate(tree, node_index, q_near, is_free)
-        if clearance is not None:
-            min_clearance = float(getattr(is_free, "minimum_clearance", 0.0))
-            clearance_margin = max(0.0, clearance - min_clearance)
-            local_step_size = min_step_size + float(adaptive_step_config.clearance_gain) * clearance_margin
-
-    local_step_size *= float(tree.step_scale)
+    node_scale = float(tree.node_step_scales[node_index])
+    local_step_size = float(step_size) * node_scale
+    local_step_cap = tree.node_step_caps[node_index]
+    if local_step_cap is not None:
+        local_step_size = min(local_step_size, float(local_step_cap))
     return float(np.clip(local_step_size, min_step_size, max_step_size))
+
+def _compute_node_sample_domain_radius(
+    tree: Tree,
+    node_index: int,
+    step_size: float,
+    adaptive_step_config: AdaptiveStepConfig | None,
+):
+    if adaptive_step_config is None or not adaptive_step_config.enabled:
+        return float("inf")
+
+    local_step_size = _compute_node_step_size(
+        tree,
+        node_index,
+        step_size,
+        adaptive_step_config,
+    )
+    return max(
+        local_step_size,
+        float(adaptive_step_config.sample_domain_step_multiplier)
+        * local_step_size
+        * float(tree.node_sample_domain_scales[node_index]),
+    )
+
+def _maybe_update_node_step_cap_from_clearance(
+    tree: Tree,
+    node_index: int,
+    q_node,
+    is_free,
+    step_size: float,
+    adaptive_step_config: AdaptiveStepConfig | None,
+):
+    if adaptive_step_config is None or not adaptive_step_config.enabled:
+        return
+    if tree.node_step_caps[node_index] is not None:
+        return
+
+    clearance_source = getattr(is_free, "strict_is_free", is_free)
+    estimate_clearance = getattr(clearance_source, "estimate_clearance", None)
+    if not callable(estimate_clearance):
+        return
+
+    clearance = float(estimate_clearance(q_node))
+    minimum_clearance = float(getattr(clearance_source, "minimum_clearance", 0.0))
+    clearance_margin = max(clearance - minimum_clearance, 0.0)
+    min_step_size, max_step_size = _resolve_step_bounds(step_size, adaptive_step_config)
+    local_step_cap = min_step_size + float(adaptive_step_config.clearance_step_cap_gain) * clearance_margin
+    tree.node_step_caps[node_index] = float(np.clip(local_step_cap, min_step_size, max_step_size))
+
+def _update_node_scale_after_success(
+    tree: Tree,
+    node_index: int,
+    candidate_step_size: float,
+    step_size: float,
+    adaptive_step_config: AdaptiveStepConfig | None,
+) -> float:
+    if adaptive_step_config is None or not adaptive_step_config.enabled:
+        return 1.0
+
+    nominal_step_size = max(1e-12, float(step_size))
+    if nominal_step_size <= 1e-12:
+        used_scale = 1.0
+    else:
+        used_scale = _clip_node_step_scale(
+            float(candidate_step_size) / nominal_step_size,
+            adaptive_step_config,
+        )
+
+    current_scale = float(tree.node_step_scales[node_index])
+    alpha = float(adaptive_step_config.successful_step_ema_alpha)
+    updated_scale = (1.0 - alpha) * current_scale + alpha * used_scale
+    if used_scale >= current_scale - 1e-6:
+        updated_scale *= float(adaptive_step_config.step_scale_growth_factor)
+    updated_scale = _clip_node_step_scale(updated_scale, adaptive_step_config)
+    tree.node_step_scales[node_index] = updated_scale
+    tree.node_failure_counts[node_index] = max(0, int(tree.node_failure_counts[node_index]) - 1)
+    tree.node_sample_domain_scales[node_index] = _clip_sample_domain_scale(
+        float(tree.node_sample_domain_scales[node_index])
+        * float(adaptive_step_config.sample_domain_growth_factor),
+        adaptive_step_config,
+    )
+    return updated_scale
+
+def _apply_node_failure_feedback(
+    tree: Tree,
+    node_index: int,
+    candidate_step_size: float,
+    q_node,
+    is_free,
+    step_size: float,
+    adaptive_step_config: AdaptiveStepConfig | None,
+):
+    if adaptive_step_config is None or not adaptive_step_config.enabled:
+        return
+
+    _maybe_update_node_step_cap_from_clearance(
+        tree,
+        node_index,
+        q_node,
+        is_free,
+        step_size,
+        adaptive_step_config,
+    )
+    nominal_step_size = max(1e-12, float(step_size))
+    target_scale = _clip_node_step_scale(
+        float(candidate_step_size) / nominal_step_size,
+        adaptive_step_config,
+    )
+    shrunken_scale = min(
+        float(tree.node_step_scales[node_index]) * float(adaptive_step_config.step_scale_shrink_factor),
+        target_scale * float(adaptive_step_config.step_scale_shrink_factor),
+    )
+    tree.node_step_scales[node_index] = _clip_node_step_scale(
+        shrunken_scale,
+        adaptive_step_config,
+    )
+    tree.node_failure_counts[node_index] = int(tree.node_failure_counts[node_index]) + 1
+    tree.node_sample_domain_scales[node_index] = _clip_sample_domain_scale(
+        float(tree.node_sample_domain_scales[node_index])
+        * float(adaptive_step_config.sample_domain_shrink_factor),
+        adaptive_step_config,
+    )
+
+def _compute_connect_step_budget(
+    tree: Tree,
+    node_index: int,
+    step_size: float,
+    max_connect_steps: int,
+    adaptive_step_config: AdaptiveStepConfig | None,
+) -> int:
+    if adaptive_step_config is None or not adaptive_step_config.enabled:
+        return int(max_connect_steps)
+
+    min_step_size, max_step_size = _resolve_step_bounds(step_size, adaptive_step_config)
+    local_step_size = _compute_node_step_size(
+        tree,
+        node_index,
+        step_size,
+        adaptive_step_config,
+    )
+    if max_step_size <= min_step_size + 1e-12:
+        openness = 1.0
+    else:
+        openness = (local_step_size - min_step_size) / (max_step_size - min_step_size)
+    openness = float(np.clip(openness, 0.0, 1.0))
+    failure_penalty = 1.0 / (1.0 + 0.5 * float(tree.node_failure_counts[node_index]))
+    domain_factor = min(1.0, float(tree.node_sample_domain_scales[node_index]))
+    budget_scale = (0.25 + 0.75 * openness) * failure_penalty * domain_factor
+    connect_budget = int(round(float(max_connect_steps) * budget_scale))
+    minimum_budget = min(int(max_connect_steps), int(adaptive_step_config.min_connect_steps))
+    return max(
+        minimum_budget,
+        min(int(max_connect_steps), connect_budget),
+    )
+
+def _find_nearest_tree_node(
+    tree: Tree,
+    q,
+    step_size: float,
+    adaptive_step_config: AdaptiveStepConfig | None,
+) -> int:
+    distances = [float(np.linalg.norm(n - q)) for n in tree.nodes]
+    if adaptive_step_config is None or not adaptive_step_config.enabled:
+        return int(np.argmin(distances))
+
+    eligible_indices = []
+    for idx, dist in enumerate(distances):
+        local_radius = _compute_node_sample_domain_radius(
+            tree,
+            idx,
+            step_size,
+            adaptive_step_config,
+        )
+        if dist <= local_radius:
+            eligible_indices.append(idx)
+    if not eligible_indices:
+        return int(np.argmin(distances))
+    return min(eligible_indices, key=lambda idx: distances[idx])
+
+def _sample_near_failure_nodes(
+    rng,
+    trees: tuple[Tree, Tree],
+    step_size: float,
+    adaptive_step_config: AdaptiveStepConfig | None,
+    joints_lower_limits,
+    joints_upper_limits,
+):
+    if adaptive_step_config is None or not adaptive_step_config.enabled:
+        return None
+
+    candidate_nodes = []
+    candidate_weights = []
+    for tree in trees:
+        for node_index, q_node in enumerate(tree.nodes):
+            failure_count = int(tree.node_failure_counts[node_index])
+            local_step_cap = tree.node_step_caps[node_index]
+            if failure_count <= 0 and local_step_cap is None:
+                continue
+            local_step_size = _compute_node_step_size(
+                tree,
+                node_index,
+                step_size,
+                adaptive_step_config,
+            )
+            weight = float(failure_count)
+            if local_step_cap is not None:
+                weight += 1.0
+            candidate_nodes.append((np.asarray(q_node, dtype=float), local_step_size))
+            candidate_weights.append(weight)
+
+    if not candidate_nodes:
+        return None
+
+    weights = np.asarray(candidate_weights, dtype=float)
+    weights /= np.sum(weights)
+    sample_index = int(rng.choice(len(candidate_nodes), p=weights))
+    q_center, local_step_size = candidate_nodes[sample_index]
+    sigma = max(
+        1e-4,
+        float(adaptive_step_config.failure_node_sample_sigma_scale) * float(local_step_size),
+    )
+    q = q_center + rng.normal(0.0, sigma, size=q_center.shape)
+    return np.clip(q, joints_lower_limits, joints_upper_limits)
+
+def _path_is_dense_free(
+    path,
+    is_free,
+    edge_resolution: float,
+    deadline_s: float | None = None,
+) -> bool:
+    for i in range(len(path) - 1):
+        if not edge_is_free(
+            is_free,
+            path[i],
+            path[i + 1],
+            resolution=edge_resolution,
+            deadline_s=deadline_s,
+        ):
+            return False
+    return True
 
 def extend_tree(
     tree: Tree,
@@ -327,6 +609,7 @@ def extend_tree(
     joints_lower_limits,
     joints_upper_limits,
     adaptive_step_config: AdaptiveStepConfig | None = None,
+    deadline_s: float | None = None,
 ):
     """
     Try to extend tree by one step toward q_target.
@@ -334,18 +617,23 @@ def extend_tree(
     """
 
     q_target = np.asarray(q_target, dtype=float)
-    index_near = find_nearest_node(tree.nodes, q_target)
-    q_near = tree.nodes[index_near]
-
-    candidate_step_size = _compute_adaptive_step_size(
+    if deadline_s is not None and time.perf_counter() > float(deadline_s):
+        raise TimeoutError("RRT-Connect timed out before finding a path.")
+    index_near = _find_nearest_tree_node(
         tree,
-        q_near,
-        index_near,
-        is_free,
+        q_target,
         step_size,
         adaptive_step_config,
-        use_clearance_estimate=(tree.node_clearance[index_near] is not None),
     )
+    q_near = tree.nodes[index_near]
+
+    candidate_step_size = _compute_node_step_size(
+        tree,
+        index_near,
+        step_size,
+        adaptive_step_config,
+    )
+    min_step_size, _ = _resolve_step_bounds(step_size, adaptive_step_config)
     attempt_count = 1
     if adaptive_step_config is not None and adaptive_step_config.enabled:
         attempt_count = max(1, int(adaptive_step_config.max_backoff_trials) + 1)
@@ -357,17 +645,29 @@ def extend_tree(
 
         if np.linalg.norm(q_new - q_near) <= 1e-12:
             break
-        if edge_is_free(is_free, q_near, q_new, resolution=edge_resolution):
+        if edge_is_free(
+            is_free,
+            q_near,
+            q_new,
+            resolution=edge_resolution,
+            deadline_s=deadline_s,
+        ):
+            inherited_scale = _update_node_scale_after_success(
+                tree,
+                index_near,
+                candidate_step_size,
+                step_size,
+                adaptive_step_config,
+            )
             tree.nodes.append(q_new)
             tree.parent.append(index_near)
-            tree.node_clearance.append(None)
-            new_idx = len(tree.nodes) - 1
-
-            _update_step_scale_controller(
-                tree,
-                adaptive_step_config,
-                extension_succeeded=True,
+            tree.node_step_scales.append(inherited_scale)
+            tree.node_sample_domain_scales.append(
+                float(tree.node_sample_domain_scales[index_near])
             )
+            tree.node_failure_counts.append(0)
+            tree.node_step_caps.append(None)
+            new_idx = len(tree.nodes) - 1
 
             # REACHED if we landed exactly on the target
             if np.linalg.norm(q_new - q_target) < 1e-8:
@@ -376,28 +676,26 @@ def extend_tree(
 
         if adaptive_step_config is None or not adaptive_step_config.enabled:
             break
-        # Query clearance only after a failed aggressive attempt, then reuse it.
-        if attempt_idx == 0 and tree.node_clearance[index_near] is None:
-            clearance_step_size = _compute_adaptive_step_size(
+        _apply_node_failure_feedback(
+            tree,
+            index_near,
+            candidate_step_size,
+            q_near,
+            is_free,
+            step_size,
+            adaptive_step_config,
+        )
+        candidate_step_size = min(
+            _compute_node_step_size(
                 tree,
-                q_near,
                 index_near,
-                is_free,
                 step_size,
                 adaptive_step_config,
-                use_clearance_estimate=True,
-            )
-            candidate_step_size = min(candidate_step_size, clearance_step_size)
-        candidate_step_size *= float(adaptive_step_config.backoff_factor)
-        min_step_size, _ = _resolve_step_bounds(step_size, adaptive_step_config)
+            ),
+            candidate_step_size * float(adaptive_step_config.backoff_factor),
+        )
         if candidate_step_size < min_step_size:
             candidate_step_size = min_step_size
-
-    _update_step_scale_controller(
-        tree,
-        adaptive_step_config,
-        extension_succeeded=False,
-    )
 
     return TRAPPED, None
 
@@ -411,17 +709,36 @@ def connect(
     joints_upper_limits,
     max_connect_steps=10_000,
     adaptive_step_config: AdaptiveStepConfig | None = None,
+    deadline_s: float | None = None,
 ):
     """
     Greedily extend tree toward q_target until TRAPPED or REACHED.
     Returns (status, last_index or None if failed).
     """
     last_index = None
-    for i in range(max_connect_steps):
+    connect_budget = int(max_connect_steps)
+    if adaptive_step_config is not None and adaptive_step_config.enabled:
+        near_index = _find_nearest_tree_node(
+            tree,
+            np.asarray(q_target, dtype=float),
+            step_size,
+            adaptive_step_config,
+        )
+        connect_budget = _compute_connect_step_budget(
+            tree,
+            near_index,
+            step_size,
+            max_connect_steps,
+            adaptive_step_config,
+        )
+    for i in range(connect_budget):
+        if deadline_s is not None and time.perf_counter() > float(deadline_s):
+            raise TimeoutError("RRT-Connect timed out before finding a path.")
         status, index = extend_tree(
             tree, q_target, is_free, step_size, edge_resolution,
             joints_lower_limits, joints_upper_limits,
             adaptive_step_config=adaptive_step_config,
+            deadline_s=deadline_s,
         )
 
         last_index = index
@@ -448,45 +765,114 @@ def rrt_connect_plan(
         enable_shortcut=True,
         shortcut_edge_resolution=None,
         shortcut_max_passes=None,
+        final_validation_edge_resolution=None,
         deadline_s=None,
+        random_seed=None,
         adaptive_step_config: AdaptiveStepConfig | None = None,
+        return_goal_index: bool = False,
 ):
     """
-    Runs RRT-connect from start and goal, then optionally short-cuts the resulting
-    waypoint path.
-    Returns a list of configurations from q_start to q_goal (inclusive).
+    Runs RRT-connect from start to one goal or a set of goals, then optionally
+    short-cuts the resulting waypoint path.
+
+    If `return_goal_index` is True and multiple goals are provided, returns
+    `(path, selected_goal_index)`.
     """
 
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(random_seed)
 
-    q_start = np.asarray(q_start)
-    q_goal = np.asarray(q_goal)
+    q_start = np.asarray(q_start, dtype=float)
     joints_lower_limits = np.asarray(joints_lower_limits)
     joints_upper_limits = np.asarray(joints_upper_limits)
+    if np.asarray(q_goal).ndim == 1:
+        candidate_goals = [(0, np.asarray(q_goal, dtype=float))]
+    else:
+        candidate_goals = [
+            (goal_index, np.asarray(goal_config, dtype=float))
+            for goal_index, goal_config in enumerate(q_goal)
+        ]
 
     _validate_adaptive_step_config(adaptive_step_config)
+    final_validation_edge_resolution = _resolve_validation_resolution(
+        edge_resolution,
+        final_validation_edge_resolution,
+    )
+    growth_is_free = getattr(is_free, "growth_is_free", is_free)
 
     T_start = Tree(q_start, adaptive_step_config=adaptive_step_config)
-    T_goal = Tree(q_goal, adaptive_step_config=adaptive_step_config)
+    feasible_goals = []
 
     # check for feasibility:
     if not is_free(q_start):
         raise RuntimeError("q_start is not a feasible configuration")
-    if not is_free(q_goal):
-        raise RuntimeError("q_goal is not a feasible configuration")
+    for goal_index, q_goal_candidate in candidate_goals:
+        if is_free(q_goal_candidate):
+            feasible_goals.append((goal_index, q_goal_candidate))
+        elif len(candidate_goals) == 1:
+            raise RuntimeError("q_goal is not a feasible configuration")
+    if not feasible_goals:
+        raise RuntimeError("No feasible q_goal candidates were provided.")
+
+    T_goal = Tree(feasible_goals[0][1], adaptive_step_config=adaptive_step_config)
+    goal_root_index_to_goal_index = {0: feasible_goals[0][0]}
+    for goal_index, q_goal_candidate in feasible_goals[1:]:
+        append_tree_root(T_goal, q_goal_candidate)
+        goal_root_index_to_goal_index[len(T_goal.nodes) - 1] = goal_index
+
+    T_start_origin = "start"
+    T_goal_origin = "goal"
+
+    for goal_index, q_goal_candidate in feasible_goals:
+        if edge_is_free(
+            growth_is_free,
+            q_start,
+            q_goal_candidate,
+            resolution=edge_resolution,
+            deadline_s=deadline_s,
+        ):
+            direct_path = [q_start.copy(), q_goal_candidate.copy()]
+            if _path_is_dense_free(
+                direct_path,
+                is_free,
+                edge_resolution=final_validation_edge_resolution,
+                deadline_s=deadline_s,
+            ):
+                if return_goal_index:
+                    return direct_path, goal_index
+                return direct_path
 
     # define function for sampling since we call it twice every time for each tree (start & goal)
-    def sample():
+    def sample(active_tree: Tree, passive_tree: Tree):
         """Mixture sampler from original RRT sampler"""
         r = rng.random()
+        failure_node_sample_rate = 0.0
+        if adaptive_step_config is not None and adaptive_step_config.enabled:
+            failure_node_sample_rate = float(adaptive_step_config.failure_node_sample_rate)
+        sampled_goal_index = int(rng.integers(len(feasible_goals)))
+        sampled_goal = feasible_goals[sampled_goal_index][1]
 
         if r < goal_sample_rate:
-            q = q_goal.copy()
+            q = sampled_goal.copy()
         elif r < goal_sample_rate + line_sample_rate:
             # sample bias near the straight-line between start and goal (with added noise)
             u = rng.random()
-            q = (1 - u) * q_start + u * q_goal + rng.normal(0.0, sigma_line, size=q_start.shape)
+            q = (
+                (1 - u) * q_start
+                + u * sampled_goal
+                + rng.normal(0.0, sigma_line, size=q_start.shape)
+            )
             q = np.clip(q, joints_lower_limits, joints_upper_limits)
+        elif r < goal_sample_rate + line_sample_rate + failure_node_sample_rate:
+            q = _sample_near_failure_nodes(
+                rng,
+                (active_tree, passive_tree),
+                step_size,
+                adaptive_step_config,
+                joints_lower_limits,
+                joints_upper_limits,
+            )
+            if q is None:
+                q = rng.uniform(joints_lower_limits, joints_upper_limits)
         else:
             q = rng.uniform(joints_lower_limits, joints_upper_limits)
 
@@ -499,64 +885,81 @@ def rrt_connect_plan(
         # Sample and reject samples that are in collision
         q_rand = None
         for i in range(max_sample_tries):
-            cand = sample()
-            if is_free(cand):
+            if deadline_s is not None and time.perf_counter() > float(deadline_s):
+                raise TimeoutError("RRT-Connect timed out before finding a path.")
+            cand = sample(T_start, T_goal)
+            if growth_is_free(cand):
                 q_rand = cand
                 break
         if q_rand is None:
-            q_rand = sample()
+            continue
 
         # Extend active tree one step toward sample
         status_start_branch, idx_start_branch = extend_tree(
-            T_start, q_rand, is_free, step_size, edge_resolution,
+            T_start, q_rand, growth_is_free, step_size, edge_resolution,
             joints_lower_limits, joints_upper_limits,
             adaptive_step_config=adaptive_step_config,
+            deadline_s=deadline_s,
         )
         if status_start_branch != TRAPPED:
             q_new = T_start.nodes[idx_start_branch]
 
             # Greedily connect the other tree toward the new node
             status_goal_branch, idx_goal_branch = connect(
-                T_goal, q_new, is_free, step_size, edge_resolution,
+                T_goal, q_new, growth_is_free, step_size, edge_resolution,
                 joints_lower_limits, joints_upper_limits,
                 max_connect_steps=max_connect_steps,
                 adaptive_step_config=adaptive_step_config,
+                deadline_s=deadline_s,
             )
 
             if status_goal_branch == REACHED:
-                # We connected at (idx_start_branch in T_start) and (idx_goal_branch in T_goal),
-                # and T_goal.nodes[idx_goal_branch] should equal q_new.
-                path_from_start = trace_path(T_start, idx_start_branch)
-                path_from_goal = trace_path(T_goal, idx_goal_branch)
-
-                # Determine which tree started at q_start
-                if np.linalg.norm(T_start.nodes[0] - q_start) < 1e-12:
-                    path_start_to_conn = path_from_start
-                    path_goal_to_conn = path_from_goal
+                if T_start_origin == "start":
+                    path_start_to_conn = trace_path(T_start, idx_start_branch)
+                    path_goal_to_conn, goal_root_index = trace_path_with_root_index(
+                        T_goal,
+                        idx_goal_branch,
+                    )
                 else:
-                    path_start_to_conn = path_from_goal
-                    path_goal_to_conn = path_from_start
+                    path_goal_to_conn, goal_root_index = trace_path_with_root_index(
+                        T_start,
+                        idx_start_branch,
+                    )
+                    path_start_to_conn = trace_path(T_goal, idx_goal_branch)
+                selected_goal_index = goal_root_index_to_goal_index[goal_root_index]
 
                 # path_goal_to_conn is root(goal) -> ... -> conn, so reverse it to conn -> ... -> goal
                 path = path_start_to_conn + path_goal_to_conn[::-1][1:]
                 raw_len = len(path)
                 if enable_shortcut:
                     shortcut_resolution = (
-                        edge_resolution if shortcut_edge_resolution is None else shortcut_edge_resolution
+                        final_validation_edge_resolution
+                        if shortcut_edge_resolution is None else float(shortcut_edge_resolution)
                     )
                     path = shortcut_path(
                         path,
                         is_free,
                         edge_resolution=shortcut_resolution,
                         max_passes=shortcut_max_passes,
+                        deadline_s=deadline_s,
                     )
+                if not _path_is_dense_free(
+                    path,
+                    is_free,
+                    edge_resolution=final_validation_edge_resolution,
+                    deadline_s=deadline_s,
+                ):
+                    continue
                 print(
                     f"RRT-Connect succeeded in {iter} iterations. "
                     f"Path length: {raw_len} -> {len(path)}"
                 )
+                if return_goal_index:
+                    return path, selected_goal_index
                 return path
 
         # Swap roles each iteration to advance one another each time
         T_start, T_goal = T_goal, T_start
+        T_start_origin, T_goal_origin = T_goal_origin, T_start_origin
 
     raise RuntimeError("RRT-Connect failed.")
