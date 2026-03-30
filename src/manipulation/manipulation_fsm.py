@@ -38,11 +38,13 @@ class ManipulationOptions:
     enable_carry_escape: bool = True
     carry_escape_clearance_threshold_m: float | None = None
     carry_escape_try_home_staging: bool = True
-    carry_escape_backoff_m: tuple[float, ...] = (0.08, 0.12, 0.04, 0.16)
-    carry_escape_lift_m: tuple[float, ...] = (0.06, 0.10, 0.02)
+    axial_pullback_step_m: float = 0.015
+    carry_escape_max_pullback_m: float = 0.20
+    carry_escape_open_clearance_margin_m: float | None = 0.02
     enable_drop_preplace: bool = True
-    drop_preplace_backoff_m: tuple[float, ...] = (0.08, 0.12, 0.04, 0.16)
-    drop_preplace_lift_m: tuple[float, ...] = (0.06, 0.02, 0.10, 0.0)
+    drop_preplace_clearance_threshold_m: float | None = None
+    drop_preplace_max_pullback_m: float = 0.20
+    drop_preplace_open_clearance_margin_m: float | None = 0.02
     enable_drop_transport_bridges: bool = True
     drop_transport_bridge_backoff_m: tuple[float, ...] = (0.25, 0.17, 0.09)
     drop_transport_bridge_low_z_offset_m: tuple[float, ...] = (-0.13, -0.03)
@@ -81,6 +83,115 @@ class ManipulationResult:
     error_message: str | None
     transition_history: list[ManipulationState]
     timings_s: dict[str, float] = dc.field(default_factory=dict)
+
+
+@dc.dataclass
+class AxialClearancePathResult:
+    path: list[np.ndarray]
+    final_clearance_m: float | None
+    stop_reason: str
+
+
+def build_axial_clearance_path(
+    q_anchor: np.ndarray,
+    *,
+    step_m: float,
+    max_pullback_m: float,
+    solve_step: typing.Callable[[float, np.ndarray, int], np.ndarray],
+    state_is_free: typing.Callable[[np.ndarray], bool],
+    edge_is_free_fn: typing.Callable[[np.ndarray, np.ndarray], bool],
+    estimate_clearance_fn: typing.Callable[[np.ndarray], float] | None = None,
+    target_clearance_m: float | None = None,
+    stop_predicate: typing.Callable[[np.ndarray], bool] | None = None,
+    check_deadline: typing.Callable[[], None] | None = None,
+) -> AxialClearancePathResult:
+    q_anchor = np.asarray(q_anchor, dtype=float).copy()
+    if float(step_m) <= 0.0:
+        raise ValueError("step_m must be positive.")
+    if float(max_pullback_m) < 0.0:
+        raise ValueError("max_pullback_m must be nonnegative.")
+
+    def _maybe_check_deadline() -> None:
+        if check_deadline is not None:
+            check_deadline()
+
+    def _maybe_estimate_clearance(q: np.ndarray) -> float | None:
+        if estimate_clearance_fn is None:
+            return None
+        return float(estimate_clearance_fn(q))
+
+    path = [q_anchor.copy()]
+    final_clearance_m = _maybe_estimate_clearance(q_anchor)
+
+    _maybe_check_deadline()
+    if stop_predicate is not None and stop_predicate(q_anchor):
+        return AxialClearancePathResult(
+            path=path,
+            final_clearance_m=final_clearance_m,
+            stop_reason="predicate",
+        )
+    if (
+        target_clearance_m is not None
+        and final_clearance_m is not None
+        and final_clearance_m >= float(target_clearance_m)
+    ):
+        return AxialClearancePathResult(
+            path=path,
+            final_clearance_m=final_clearance_m,
+            stop_reason="clearance",
+        )
+
+    pullback_distances = list(
+        np.arange(float(step_m), float(max_pullback_m) + 1e-12, float(step_m))
+    )
+    if not pullback_distances or pullback_distances[-1] < float(max_pullback_m) - 1e-12:
+        pullback_distances.append(float(max_pullback_m))
+
+    q_prev = q_anchor.copy()
+    for step_index, pullback_m in enumerate(pullback_distances, start=1):
+        _maybe_check_deadline()
+        try:
+            q_next = solve_step(float(pullback_m), q_prev.copy(), step_index)
+        except TimeoutError:
+            raise
+        except Exception:
+            continue
+
+        q_next = np.asarray(q_next, dtype=float).copy()
+        _maybe_check_deadline()
+        if not state_is_free(q_next):
+            continue
+        _maybe_check_deadline()
+        if not edge_is_free_fn(q_prev, q_next):
+            continue
+
+        path.append(q_next.copy())
+        q_prev = q_next
+        final_clearance_m = _maybe_estimate_clearance(q_prev)
+
+        _maybe_check_deadline()
+        if stop_predicate is not None and stop_predicate(q_prev):
+            return AxialClearancePathResult(
+                path=path,
+                final_clearance_m=final_clearance_m,
+                stop_reason="predicate",
+            )
+        if (
+            target_clearance_m is not None
+            and final_clearance_m is not None
+            and final_clearance_m >= float(target_clearance_m)
+        ):
+            return AxialClearancePathResult(
+                path=path,
+                final_clearance_m=final_clearance_m,
+                stop_reason="clearance",
+            )
+
+    return AxialClearancePathResult(
+        path=path,
+        final_clearance_m=final_clearance_m,
+        stop_reason="exhausted",
+    )
 
 
 class ManipulationFSM:
@@ -239,6 +350,143 @@ class ManipulationFSM:
         )
 
     @staticmethod
+    def _resolve_open_clearance_target(
+        is_free_fn: typing.Callable[[np.ndarray], bool],
+        absolute_threshold_m: float | None,
+        open_margin_m: float | None,
+    ) -> float | None:
+        estimate_clearance = getattr(is_free_fn, "estimate_clearance", None)
+        if not callable(estimate_clearance):
+            return None
+        if absolute_threshold_m is not None:
+            return float(absolute_threshold_m)
+        if open_margin_m is None:
+            return None
+        return float(getattr(is_free_fn, "minimum_clearance", 0.0)) + max(
+            0.0, float(open_margin_m)
+        )
+
+    def _calc_carrier_frame_pose(
+        self,
+        q_iiwa: np.ndarray,
+        q_wsg_instance: np.ndarray | None = None,
+    ) -> RigidTransform:
+        q_iiwa = np.asarray(q_iiwa, dtype=float).reshape(7)
+        fk_root_context = self.root_context_current.Clone()
+        plant_context = self.plant.GetMyMutableContextFromRoot(fk_root_context)
+        self.plant.SetPositions(plant_context, self.iiwa_instance, q_iiwa)
+
+        if self.wsg_instance is not None:
+            if q_wsg_instance is None:
+                q_wsg_instance = self.plant.GetPositions(
+                    plant_context, self.wsg_instance
+                ).copy()
+            q_wsg_instance = np.asarray(q_wsg_instance, dtype=float).reshape(-1)
+            self.plant.SetPositions(plant_context, self.wsg_instance, q_wsg_instance)
+
+        carrier_frame = self.plant.GetFrameByName(
+            self.carry_payload_carrier_frame_name,
+            self.wsg_instance,
+        )
+        return self.plant.CalcRelativeTransform(
+            plant_context,
+            self.plant.world_frame(),
+            carrier_frame,
+        )
+
+    def _plan_axial_clearance_path(
+        self,
+        q_anchor: np.ndarray,
+        is_free_fn: typing.Callable[[np.ndarray], bool],
+        *,
+        absolute_clearance_threshold_m: float | None,
+        open_clearance_margin_m: float | None,
+        max_pullback_m: float,
+        step_m: float,
+        planning_deadline_s: float | None = None,
+        stop_predicate: typing.Callable[[np.ndarray], bool] | None = None,
+        soft_start_seed_base: int = 0,
+    ) -> AxialClearancePathResult:
+        q_anchor = np.asarray(q_anchor, dtype=float).reshape(7)
+        X_anchor = self._calc_carrier_frame_pose(
+            q_anchor,
+            q_wsg_instance=self.q_wsg_carry,
+        )
+        R_anchor = X_anchor.rotation()
+        p_anchor = np.asarray(X_anchor.translation(), dtype=float).reshape(3)
+        approach_axis_W = R_anchor.matrix()[:, 1]
+        estimate_clearance_fn = getattr(is_free_fn, "estimate_clearance", None)
+        target_clearance_m = self._resolve_open_clearance_target(
+            is_free_fn,
+            absolute_clearance_threshold_m,
+            open_clearance_margin_m,
+        )
+
+        def _check_deadline() -> None:
+            if planning_deadline_s is not None and time.perf_counter() > float(
+                planning_deadline_s
+            ):
+                raise TimeoutError(
+                    f"Planning exceeded time budget of {self.options.max_planning_time_s:.1f}s"
+                )
+
+        def _solve_step(
+            pullback_m: float,
+            q_seed: np.ndarray,
+            step_index: int,
+        ) -> np.ndarray:
+            _check_deadline()
+            X_target = RigidTransform(
+                R_anchor,
+                p_anchor - float(pullback_m) * approach_axis_W,
+            )
+            return solve_iiwa_ik_for_gripper_pose(
+                plant=self.plant,
+                root_context_current=self.root_context_current,
+                iiwa_instance=self.iiwa_instance,
+                wsg_instance=self.wsg_instance,
+                desired_end_effector=X_target,
+                q_iiwa_seed=q_seed,
+                position_tol=self.options.position_tol,
+                theta_tol=self.options.theta_tol,
+                max_soft_starts=self.options.ik_soft_starts,
+                soft_start_sigma=self.options.ik_soft_start_sigma,
+                soft_start_random_seed=(
+                    self.options.ik_soft_start_seed + soft_start_seed_base + step_index
+                ),
+            )
+
+        def _state_is_free(q: np.ndarray) -> bool:
+            _check_deadline()
+            return bool(is_free_fn(q))
+
+        def _edge_is_free(q_start: np.ndarray, q_goal: np.ndarray) -> bool:
+            _check_deadline()
+            return self._strict_edge_is_free(
+                q_start,
+                q_goal,
+                is_free_fn,
+                planning_deadline_s=planning_deadline_s,
+            )
+
+        def _stop_predicate(q: np.ndarray) -> bool:
+            _check_deadline()
+            return bool(stop_predicate(q)) if stop_predicate is not None else False
+
+        return build_axial_clearance_path(
+            q_anchor=q_anchor,
+            step_m=step_m,
+            max_pullback_m=max_pullback_m,
+            solve_step=_solve_step,
+            state_is_free=_state_is_free,
+            edge_is_free_fn=_edge_is_free,
+            estimate_clearance_fn=estimate_clearance_fn,
+            target_clearance_m=target_clearance_m,
+            stop_predicate=_stop_predicate if stop_predicate is not None else None,
+            check_deadline=_check_deadline,
+        )
+
+    @staticmethod
     def _merge_joint_paths(*paths: list[np.ndarray]) -> list[np.ndarray]:
         merged: list[np.ndarray] = []
         for path in paths:
@@ -249,125 +497,48 @@ class ManipulationFSM:
                 merged.append(q_arr)
         return merged
 
-    def _iter_offset_pose_candidates(
-        self,
-        X_WG_target: RigidTransform,
-        backoff_values_m: tuple[float, ...],
-        lift_values_m: tuple[float, ...],
-    ):
-        R_WG_target = X_WG_target.rotation()
-        p_WG_target = np.asarray(X_WG_target.translation(), dtype=float).reshape(3)
-        approach_axis_W = R_WG_target.matrix()[:, 1]
-        world_up_W = np.array([0.0, 0.0, 1.0])
-
-        for backoff_m in backoff_values_m:
-            for lift_m in lift_values_m:
-                backoff_m = float(backoff_m)
-                lift_m = float(lift_m)
-                if abs(backoff_m) <= 1e-12 and abs(lift_m) <= 1e-12:
-                    continue
-                p_WG_escape = (
-                    p_WG_target
-                    - backoff_m * approach_axis_W
-                    + lift_m * world_up_W
-                )
-                yield RigidTransform(R_WG_target, p_WG_escape)
-
     def _plan_carry_escape_prefix(
         self,
         q_home: np.ndarray,
         q_postgrasp_retreat: np.ndarray,
-        X_WG_pregrasp: RigidTransform,
         planning_deadline_s: float | None = None,
     ) -> tuple[list[np.ndarray], np.ndarray]:
         q_home = np.asarray(q_home, dtype=float).reshape(7)
         q_postgrasp_retreat = np.asarray(q_postgrasp_retreat, dtype=float).reshape(7)
-        carry_prefix = [q_postgrasp_retreat.copy()]
-
-        if not bool(self.options.enable_carry_escape):
-            return carry_prefix, q_postgrasp_retreat.copy()
-
-        clearance_threshold_m = self.options.carry_escape_clearance_threshold_m
-        estimate_clearance = getattr(self.is_free_carry, "estimate_clearance", None)
-        if clearance_threshold_m is not None and callable(estimate_clearance):
-            retreat_clearance_m = float(estimate_clearance(q_postgrasp_retreat))
-            if retreat_clearance_m >= float(clearance_threshold_m):
-                return carry_prefix, q_postgrasp_retreat.copy()
-
         home_is_carry_feasible = bool(self.is_free_carry(q_home))
-        if (
-            bool(self.options.carry_escape_try_home_staging)
-            and home_is_carry_feasible
-            and self._strict_edge_is_free(
-                q_postgrasp_retreat,
+
+        def _can_stage_home(q_current: np.ndarray) -> bool:
+            if not bool(self.options.carry_escape_try_home_staging):
+                return False
+            if not home_is_carry_feasible:
+                return False
+            return self._strict_edge_is_free(
+                q_current,
                 q_home,
                 self.is_free_carry,
                 planning_deadline_s=planning_deadline_s,
             )
-        ):
-            return self._merge_joint_paths(carry_prefix, [q_home]), q_home.copy()
 
-        best_escape_path: list[np.ndarray] | None = None
-        best_escape_q: np.ndarray | None = None
-        for candidate_index, X_WG_escape in enumerate(
-            self._iter_offset_pose_candidates(
-                X_WG_pregrasp,
-                self.options.carry_escape_backoff_m,
-                self.options.carry_escape_lift_m,
-            )
-        ):
-            if planning_deadline_s is not None and time.perf_counter() > float(planning_deadline_s):
-                raise TimeoutError(
-                    f"Planning exceeded time budget of {self.options.max_planning_time_s:.1f}s"
-                )
-            try:
-                q_escape = solve_iiwa_ik_for_gripper_pose(
-                    plant=self.plant,
-                    root_context_current=self.root_context_current,
-                    iiwa_instance=self.iiwa_instance,
-                    wsg_instance=self.wsg_instance,
-                    desired_end_effector=X_WG_escape,
-                    q_iiwa_seed=q_postgrasp_retreat,
-                    position_tol=self.options.position_tol,
-                    theta_tol=self.options.theta_tol,
-                    max_soft_starts=self.options.ik_soft_starts,
-                    soft_start_sigma=self.options.ik_soft_start_sigma,
-                    soft_start_random_seed=self.options.ik_soft_start_seed + 1_000 + candidate_index,
-                )
-            except Exception:
-                continue
-
-            q_escape = np.asarray(q_escape, dtype=float).reshape(7)
-            if not self.is_free_carry(q_escape):
-                continue
-            if not self._strict_edge_is_free(
-                q_postgrasp_retreat,
-                q_escape,
-                self.is_free_carry,
+        if not bool(self.options.enable_carry_escape):
+            carry_prefix = [q_postgrasp_retreat.copy()]
+        else:
+            axial_result = self._plan_axial_clearance_path(
+                q_anchor=q_postgrasp_retreat,
+                is_free_fn=self.is_free_carry,
+                absolute_clearance_threshold_m=self.options.carry_escape_clearance_threshold_m,
+                open_clearance_margin_m=self.options.carry_escape_open_clearance_margin_m,
+                max_pullback_m=self.options.carry_escape_max_pullback_m,
+                step_m=self.options.axial_pullback_step_m,
                 planning_deadline_s=planning_deadline_s,
-            ):
-                continue
+                stop_predicate=_can_stage_home,
+                soft_start_seed_base=1_000,
+            )
+            carry_prefix = [np.asarray(q, dtype=float).copy() for q in axial_result.path]
 
-            escape_path = self._merge_joint_paths(carry_prefix, [q_escape])
-            if best_escape_path is None:
-                best_escape_path = escape_path
-                best_escape_q = q_escape.copy()
-
-            if (
-                bool(self.options.carry_escape_try_home_staging)
-                and home_is_carry_feasible
-                and self._strict_edge_is_free(
-                    q_escape,
-                    q_home,
-                    self.is_free_carry,
-                    planning_deadline_s=planning_deadline_s,
-                )
-            ):
-                return self._merge_joint_paths(escape_path, [q_home]), q_home.copy()
-
-        if best_escape_path is not None and best_escape_q is not None:
-            return best_escape_path, best_escape_q
-        return carry_prefix, q_postgrasp_retreat.copy()
+        q_carry_start = carry_prefix[-1].copy()
+        if _can_stage_home(q_carry_start):
+            return self._merge_joint_paths(carry_prefix, [q_home]), q_home.copy()
+        return carry_prefix, q_carry_start
 
     def _find_drop_transit_goal(
         self,
@@ -381,52 +552,24 @@ class ManipulationFSM:
         if not bool(self.options.enable_drop_preplace):
             return q_drop_candidate.copy(), default_insertion_path
 
-        for preplace_index, X_WG_preplace in enumerate(
-            self._iter_offset_pose_candidates(
-                X_WG_drop_candidate,
-                self.options.drop_preplace_backoff_m,
-                self.options.drop_preplace_lift_m,
-            )
-        ):
-            if planning_deadline_s is not None and time.perf_counter() > float(planning_deadline_s):
-                raise TimeoutError(
-                    f"Planning exceeded time budget of {self.options.max_planning_time_s:.1f}s"
-                )
-            try:
-                q_preplace = solve_iiwa_ik_for_gripper_pose(
-                    plant=self.plant,
-                    root_context_current=self.root_context_current,
-                    iiwa_instance=self.iiwa_instance,
-                    wsg_instance=self.wsg_instance,
-                    desired_end_effector=X_WG_preplace,
-                    q_iiwa_seed=q_drop_candidate,
-                    position_tol=self.options.position_tol,
-                    theta_tol=self.options.theta_tol,
-                    max_soft_starts=self.options.ik_soft_starts,
-                    soft_start_sigma=self.options.ik_soft_start_sigma,
-                    soft_start_random_seed=(
-                        self.options.ik_soft_start_seed
-                        + 10_000
-                        + 100 * candidate_index
-                        + preplace_index
-                    ),
-                )
-            except Exception:
-                continue
+        axial_result = self._plan_axial_clearance_path(
+            q_anchor=q_drop_candidate,
+            is_free_fn=self.is_free_carry,
+            absolute_clearance_threshold_m=self.options.drop_preplace_clearance_threshold_m,
+            open_clearance_margin_m=self.options.drop_preplace_open_clearance_margin_m,
+            max_pullback_m=self.options.drop_preplace_max_pullback_m,
+            step_m=self.options.axial_pullback_step_m,
+            planning_deadline_s=planning_deadline_s,
+            soft_start_seed_base=10_000 + 100 * candidate_index,
+        )
+        if len(axial_result.path) <= 1:
+            return q_drop_candidate.copy(), default_insertion_path
 
-            q_preplace = np.asarray(q_preplace, dtype=float).reshape(7)
-            if not self.is_free_carry(q_preplace):
-                continue
-            if not self._strict_edge_is_free(
-                q_preplace,
-                q_drop_candidate,
-                self.is_free_carry,
-                planning_deadline_s=planning_deadline_s,
-            ):
-                continue
-            return q_preplace.copy(), [q_preplace.copy(), q_drop_candidate.copy()]
-
-        return q_drop_candidate.copy(), default_insertion_path
+        insertion_path = [
+            np.asarray(q, dtype=float).copy() for q in axial_result.path[::-1]
+        ]
+        q_preplace = insertion_path[0]
+        return q_preplace.copy(), insertion_path
 
     def _iter_drop_transport_bridge_poses(
         self,
@@ -477,8 +620,6 @@ class ManipulationFSM:
         planning_deadline_s: float | None = None,
     ) -> tuple[np.ndarray, list[np.ndarray], int, RigidTransform] | None:
         if not bool(self.options.enable_drop_transport_bridges):
-            return None
-        if len(path_carry_escape) <= 1:
             return None
 
         q_transit_start = np.asarray(q_transit_start, dtype=float).reshape(7)
@@ -790,7 +931,6 @@ class ManipulationFSM:
             path_carry_escape, q_drop_rrt_start = self._plan_carry_escape_prefix(
                 q_home=q_home,
                 q_postgrasp_retreat=grasp_plan.q_postgrasp_retreat,
-                X_WG_pregrasp=X_WG_pregrasp,
                 planning_deadline_s=planning_deadline_s,
             )
             timings_s["plan_carry_escape"] = time.perf_counter() - carry_escape_start
@@ -845,22 +985,21 @@ class ManipulationFSM:
                             [np.asarray(q, dtype=float).copy() for q in insertion_path],
                         )
                     )
-                    if len(path_carry_escape) > 1:
-                        deterministic_drop = self._try_deterministic_drop_transport(
-                            q_transit_start=q_drop_rrt_start,
-                            path_carry_escape=path_carry_escape,
-                            X_WG_drop_reference=X_WG_drop,
-                            feasible_drop_candidates=feasible_drop_candidates,
-                            planning_deadline_s=planning_deadline_s,
-                        )
-                        if deterministic_drop is not None:
-                            (
-                                q_drop,
-                                path_pregrasp_to_drop,
-                                drop_candidate_index,
-                                X_WG_drop_selected,
-                            ) = deterministic_drop
-                            break
+                    deterministic_drop = self._try_deterministic_drop_transport(
+                        q_transit_start=q_drop_rrt_start,
+                        path_carry_escape=path_carry_escape,
+                        X_WG_drop_reference=X_WG_drop,
+                        feasible_drop_candidates=feasible_drop_candidates,
+                        planning_deadline_s=planning_deadline_s,
+                    )
+                    if deterministic_drop is not None:
+                        (
+                            q_drop,
+                            path_pregrasp_to_drop,
+                            drop_candidate_index,
+                            X_WG_drop_selected,
+                        ) = deterministic_drop
+                        break
                 except TimeoutError:
                     drop_failures.append(f"drop_candidate_{candidate_index}: planning timeout")
                 except Exception as exc:
