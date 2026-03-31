@@ -170,7 +170,6 @@ def main():
         "mid": np.array([0.0, 0.15, 0.30]),
         "high": np.array([0.0, 0.15, 0.56]),
     }
-
     # sample parser arguments from source Drake code (slightly modified)
     parser = argparse.ArgumentParser(
         description="Run StarterEnv in Meshcat using Drake hardware_sim starter."
@@ -364,7 +363,7 @@ def main():
     print("\n[Pregrasp] X_WG_pregrasp =", X_WG_pregrasp)
 
     # Drop target for place/release.
-    drop_position_W = np.array([0.0, 0.15, 0.58])
+    drop_position_W = np.array([0.1, 0.09, 0.58])
     X_WG_drop = RigidTransform(X_WG_pregrasp.rotation(), drop_position_W)
 
     joints_lower_limits, joints_upper_limits = _compute_iiwa_joint_limits(sim_plant, iiwa)
@@ -386,14 +385,25 @@ def main():
         retreat_offset_world_y_m=0.0,
         retreat_offset_world_z_m=0.02,
     )
+    max_planning_time_s = 600.0
+    # Keep early stages on a shorter leash so pathological home->pregrasp
+    # failures surface quickly, while leaving most of the budget for the
+    # payload-carrying drop side.
+    home_to_pregrasp_time_budget_s = 0.15 * max_planning_time_s
+    grasp_primitive_time_budget_s = 0.20 * max_planning_time_s
+    pregrasp_to_drop_time_budget_s = 0.60 * max_planning_time_s
     shared_rrt_config = RRTConnectConfig()
     fsm_options = ManipulationOptions(
         ik_soft_starts=ik_soft_starts,
+        local_ik_soft_starts=2,
         ik_soft_start_sigma=0.08,
         ik_soft_start_seed=0,
-        max_planning_time_s=600.0,
+        max_planning_time_s=max_planning_time_s,
+        home_to_pregrasp_time_budget_s=home_to_pregrasp_time_budget_s,
+        grasp_primitive_time_budget_s=grasp_primitive_time_budget_s,
+        pregrasp_to_drop_time_budget_s=pregrasp_to_drop_time_budget_s,
         rrt=shared_rrt_config,
-        drop_candidate_time_budget_s=400.0,
+        drop_candidate_time_budget_s=8.0,
         max_drop_candidates=20,
         grasp_options=grasp_options,
     )

@@ -6,7 +6,11 @@ import numpy as np
 from pydrake.math import RigidTransform, RollPitchYaw, RotationMatrix
 
 from src.planning.IK import solve_iiwa_ik_for_gripper_pose
-from src.planning.rrt_connect import RRTConnectConfig, rrt_connect_plan
+from src.planning.rrt_connect import (
+    RRTConnectConfig,
+    postprocess_rrt_path,
+    rrt_connect_plan,
+)
 
 
 @dc.dataclass(frozen=True)
@@ -99,14 +103,22 @@ def _plan_rrt_segment(
     joints_upper_limits: np.ndarray,
     planner_config: RRTConnectConfig,
     planning_deadline_s: float | None = None,
+    search_is_free: typing.Callable[[np.ndarray], bool] | None = None,
 ) -> list[np.ndarray]:
-    return rrt_connect_plan(
+    raw_path = rrt_connect_plan(
         q_start=q_start,
         q_goal=q_goal,
         is_free=is_free,
+        search_is_free=search_is_free,
         joints_lower_limits=joints_lower_limits,
         joints_upper_limits=joints_upper_limits,
         **planner_config.to_plan_kwargs(deadline_s=planning_deadline_s),
+    )
+    return postprocess_rrt_path(
+        raw_path,
+        is_free,
+        planner_config=planner_config,
+        deadline_s=planning_deadline_s,
     )
 
 
@@ -129,6 +141,7 @@ def _plan_cartesian_approach_segment(
     X_WG_grasp: RigidTransform,
     options: GraspOptions,
     variant_index: int,
+    planning_deadline_s: float | None = None,
 ) -> list[np.ndarray]:
     q_pregrasp = np.asarray(q_pregrasp, dtype=float).reshape(7)
     p_start = np.asarray(X_WG_pregrasp.translation(), dtype=float).reshape(3)
@@ -161,6 +174,7 @@ def _plan_cartesian_approach_segment(
             soft_start_random_seed=(
                 options.ik_soft_start_seed + 10_000 * variant_index + segment_idx
             ),
+            deadline_s=planning_deadline_s,
         )
         if not is_free(q_waypoint):
             raise RuntimeError(
@@ -225,6 +239,7 @@ def plan_grasp_primitive(
                 max_soft_starts=options.ik_soft_starts,
                 soft_start_sigma=options.ik_soft_start_sigma,
                 soft_start_random_seed=options.ik_soft_start_seed + variant_index,
+                deadline_s=planning_deadline_s,
             )
 
             if not is_free(q_grasp):
@@ -245,6 +260,7 @@ def plan_grasp_primitive(
                         X_WG_grasp=X_WG_grasp,
                         options=options,
                         variant_index=variant_index,
+                        planning_deadline_s=planning_deadline_s,
                     )
                 except Exception as straight_exc:
                     try:
@@ -289,6 +305,7 @@ def plan_grasp_primitive(
                 max_soft_starts=options.ik_soft_starts,
                 soft_start_sigma=options.ik_soft_start_sigma,
                 soft_start_random_seed=options.ik_soft_start_seed + 1000 + variant_index,
+                deadline_s=planning_deadline_s,
             )
             if not is_free_retreat(q_retreat):
                 failure_reasons.append(

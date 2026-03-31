@@ -49,7 +49,8 @@ class RRTConnectConfig:
 
     The adaptive controller is the mechanism for handling clutter vs open space
     online, so this profile should be reused across phases instead of tuning
-    separate stage-specific step sizes.
+    separate stage-specific step sizes. Shortcutting is configured here as an
+    optional post-process, but it is not part of the search itself.
     """
     step_size: float = 0.9
     goal_sample_rate: float = 0.30
@@ -59,9 +60,10 @@ class RRTConnectConfig:
     edge_resolution: float = 0.07
     max_sample_tries: int = 30
     max_connect_steps: int = 250
-    enable_shortcut: bool = False
+    enable_shortcut: bool = True
     shortcut_edge_resolution: float | None = None
-    shortcut_max_passes: int | None = 1
+    shortcut_max_attempts: int | None = 128
+    shortcut_time_budget_s: float | None = 1.0
     final_validation_edge_resolution: float | None = 0.03
     random_seed: int | None = None
     adaptive_step_config: AdaptiveStepConfig = dc.field(
@@ -100,14 +102,57 @@ class RRTConnectConfig:
             "edge_resolution": float(self.edge_resolution),
             "max_sample_tries": int(self.max_sample_tries),
             "max_connect_steps": int(self.max_connect_steps),
-            "enable_shortcut": bool(self.enable_shortcut),
-            "shortcut_edge_resolution": self.shortcut_edge_resolution,
-            "shortcut_max_passes": self.shortcut_max_passes,
             "final_validation_edge_resolution": self.final_validation_edge_resolution,
             "deadline_s": deadline_s,
             "random_seed": self.random_seed,
             "adaptive_step_config": self.adaptive_step_config,
         }
+
+
+@dc.dataclass
+class RRTConnectTelemetry:
+    feasible_goals: int = 0
+    iterations: int = 0
+    direct_edge_checks: int = 0
+    direct_edge_growth_successes: int = 0
+    direct_edge_validation_successes: int = 0
+    direct_edge_validation_failures: int = 0
+    sample_attempts: int = 0
+    sample_rejections: int = 0
+    sample_successes: int = 0
+    extend_trapped: int = 0
+    extend_advanced: int = 0
+    connect_trapped: int = 0
+    connect_advanced: int = 0
+    connect_reached: int = 0
+    candidate_paths_found: int = 0
+    candidate_paths_rejected_final_validation: int = 0
+    elapsed_s: float = 0.0
+
+    def finalize(self, search_start_s: float) -> None:
+        self.elapsed_s = float(time.perf_counter() - float(search_start_s))
+
+    def summary(self) -> str:
+        return (
+            "RRT telemetry: "
+            f"elapsed_s={self.elapsed_s:.3f}, "
+            f"feasible_goals={self.feasible_goals}, "
+            f"iterations={self.iterations}, "
+            f"direct_edge_checks={self.direct_edge_checks}, "
+            f"direct_edge_growth_successes={self.direct_edge_growth_successes}, "
+            f"direct_edge_validation_successes={self.direct_edge_validation_successes}, "
+            f"direct_edge_validation_failures={self.direct_edge_validation_failures}, "
+            f"sample_attempts={self.sample_attempts}, "
+            f"sample_rejections={self.sample_rejections}, "
+            f"sample_successes={self.sample_successes}, "
+            f"extend_trapped={self.extend_trapped}, "
+            f"extend_advanced={self.extend_advanced}, "
+            f"connect_trapped={self.connect_trapped}, "
+            f"connect_advanced={self.connect_advanced}, "
+            f"connect_reached={self.connect_reached}, "
+            f"candidate_paths_found={self.candidate_paths_found}, "
+            f"candidate_paths_rejected_final_validation={self.candidate_paths_rejected_final_validation}"
+        )
 
 
 class Tree:
@@ -185,50 +230,134 @@ def edge_is_free(is_free, q0, q1, resolution=0.02, deadline_s: float | None = No
     return True
 
 
-def shortcut_path(path, is_free, edge_resolution=0.01, max_passes=None, deadline_s: float | None = None):
+def _copy_joint_path(path) -> list[np.ndarray]:
+    return [np.asarray(q, dtype=float).copy() for q in path]
+
+
+def _joint_path_length(path) -> float:
+    path = _copy_joint_path(path)
+    if len(path) <= 1:
+        return 0.0
+    return float(sum(np.linalg.norm(path[i + 1] - path[i]) for i in range(len(path) - 1)))
+
+
+def randomized_shortcut_path(
+    path,
+    is_free,
+    *,
+    edge_resolution=0.01,
+    max_attempts: int | None = None,
+    random_seed: int | None = None,
+    deadline_s: float | None = None,
+):
     """
-    Repeatedly tries to replace path sub-sequences with straight joint-space edges.
-    Stops when a full pass finds no valid shortcut, or max_passes is reached.
+    Randomized shortcutting over waypoint indices with a hard attempt budget.
+
+    This is intentionally a cheap proposal stage. Callers are expected to run
+    one strict final validation pass before accepting the shortened result.
     """
 
-    path = [np.asarray(q, dtype=float).copy() for q in path]
+    path = _copy_joint_path(path)
     if len(path) <= 2:
         return path
 
-    passes = 0
-    while True:
+    rng = np.random.default_rng(random_seed)
+    attempts = 0
+    while len(path) > 2:
         if deadline_s is not None and time.perf_counter() > float(deadline_s):
             raise TimeoutError("RRT-Connect timed out before finding a path.")
-        if max_passes is not None and passes >= max_passes:
+        if max_attempts is not None and attempts >= int(max_attempts):
             break
 
-        improved = False
+        attempts += 1
         n = len(path)
-
-        # Try larger index gaps first to remove as many intermediate nodes as possible.
-        for gap in range(n - 1, 1, -1):
-            for i in range(0, n - gap):
-                j = i + gap
-                if deadline_s is not None and time.perf_counter() > float(deadline_s):
-                    raise TimeoutError("RRT-Connect timed out before finding a path.")
-                if edge_is_free(
-                    is_free,
-                    path[i],
-                    path[j],
-                    resolution=edge_resolution,
-                    deadline_s=deadline_s,
-                ):
-                    path = path[: i + 1] + path[j:]
-                    improved = True
-                    break
-            if improved:
-                break
-
-        passes += 1
-        if not improved:
-            break
+        i = int(rng.integers(0, n - 2))
+        j = int(rng.integers(i + 2, n))
+        if edge_is_free(
+            is_free,
+            path[i],
+            path[j],
+            resolution=edge_resolution,
+            deadline_s=deadline_s,
+        ):
+            path = path[: i + 1] + path[j:]
 
     return path
+
+
+def _resolve_shortcut_deadline(
+    shortcut_time_budget_s: float | None,
+    planning_deadline_s: float | None,
+) -> float | None:
+    shortcut_deadline_s = planning_deadline_s
+    if shortcut_time_budget_s is not None:
+        local_deadline_s = time.perf_counter() + max(0.0, float(shortcut_time_budget_s))
+        if shortcut_deadline_s is None:
+            shortcut_deadline_s = local_deadline_s
+        else:
+            shortcut_deadline_s = min(shortcut_deadline_s, local_deadline_s)
+    return shortcut_deadline_s
+
+
+def postprocess_rrt_path(
+    path,
+    is_free,
+    *,
+    planner_config: RRTConnectConfig,
+    deadline_s: float | None = None,
+):
+    """
+    Optionally smooths an already-valid RRT path while preserving the raw path as
+    fallback if shortcutting does not help, times out, or fails strict validation.
+    """
+
+    raw_path = _copy_joint_path(path)
+    if len(raw_path) <= 2 or not bool(planner_config.enable_shortcut):
+        return raw_path
+
+    proposal_checker = getattr(is_free, "growth_is_free", is_free)
+    strict_checker = getattr(proposal_checker, "strict_is_free", is_free)
+    shortcut_resolution = (
+        float(planner_config.edge_resolution)
+        if planner_config.shortcut_edge_resolution is None
+        else float(planner_config.shortcut_edge_resolution)
+    )
+    final_validation_edge_resolution = _resolve_validation_resolution(
+        planner_config.edge_resolution,
+        planner_config.final_validation_edge_resolution,
+    )
+    shortcut_deadline_s = _resolve_shortcut_deadline(
+        planner_config.shortcut_time_budget_s,
+        deadline_s,
+    )
+
+    try:
+        candidate_path = randomized_shortcut_path(
+            raw_path,
+            proposal_checker,
+            edge_resolution=shortcut_resolution,
+            max_attempts=planner_config.shortcut_max_attempts,
+            random_seed=planner_config.random_seed,
+            deadline_s=shortcut_deadline_s,
+        )
+    except TimeoutError:
+        return raw_path
+
+    if _joint_path_length(candidate_path) >= _joint_path_length(raw_path) - 1e-12:
+        return raw_path
+
+    try:
+        if not _path_is_dense_free(
+            candidate_path,
+            strict_checker,
+            edge_resolution=final_validation_edge_resolution,
+            deadline_s=shortcut_deadline_s,
+        ):
+            return raw_path
+    except TimeoutError:
+        return raw_path
+
+    return candidate_path
 
 def trace_path(tree: Tree, idx: int):
     """Returns path from root to idx (inclusive)."""
@@ -754,6 +883,7 @@ def rrt_connect_plan(
         is_free,
         joints_lower_limits,
         joints_upper_limits,
+        search_is_free=None,
         step_size = 0.1,
         goal_sample_rate = 0.1,
         line_sample_rate=0.55,
@@ -762,9 +892,6 @@ def rrt_connect_plan(
         edge_resolution=0.01,
         max_sample_tries=30,
         max_connect_steps=10000,
-        enable_shortcut=True,
-        shortcut_edge_resolution=None,
-        shortcut_max_passes=None,
         final_validation_edge_resolution=None,
         deadline_s=None,
         random_seed=None,
@@ -772,14 +899,19 @@ def rrt_connect_plan(
         return_goal_index: bool = False,
 ):
     """
-    Runs RRT-connect from start to one goal or a set of goals, then optionally
-    short-cuts the resulting waypoint path.
+    Runs search-only RRT-connect from start to one goal or a set of goals.
 
     If `return_goal_index` is True and multiple goals are provided, returns
     `(path, selected_goal_index)`.
     """
 
     rng = np.random.default_rng(random_seed)
+    search_start_s = time.perf_counter()
+    telemetry = RRTConnectTelemetry()
+
+    def _raise_with_telemetry(exc_type, message: str):
+        telemetry.finalize(search_start_s)
+        raise exc_type(f"{message} {telemetry.summary()}")
 
     q_start = np.asarray(q_start, dtype=float)
     joints_lower_limits = np.asarray(joints_lower_limits)
@@ -797,21 +929,23 @@ def rrt_connect_plan(
         edge_resolution,
         final_validation_edge_resolution,
     )
-    growth_is_free = getattr(is_free, "growth_is_free", is_free)
+    if search_is_free is None:
+        search_is_free = getattr(is_free, "growth_is_free", is_free)
 
     T_start = Tree(q_start, adaptive_step_config=adaptive_step_config)
     feasible_goals = []
 
     # check for feasibility:
     if not is_free(q_start):
-        raise RuntimeError("q_start is not a feasible configuration")
+        _raise_with_telemetry(RuntimeError, "q_start is not a feasible configuration.")
     for goal_index, q_goal_candidate in candidate_goals:
         if is_free(q_goal_candidate):
             feasible_goals.append((goal_index, q_goal_candidate))
         elif len(candidate_goals) == 1:
-            raise RuntimeError("q_goal is not a feasible configuration")
+            _raise_with_telemetry(RuntimeError, "q_goal is not a feasible configuration.")
     if not feasible_goals:
-        raise RuntimeError("No feasible q_goal candidates were provided.")
+        _raise_with_telemetry(RuntimeError, "No feasible q_goal candidates were provided.")
+    telemetry.feasible_goals = len(feasible_goals)
 
     T_goal = Tree(feasible_goals[0][1], adaptive_step_config=adaptive_step_config)
     goal_root_index_to_goal_index = {0: feasible_goals[0][0]}
@@ -823,23 +957,35 @@ def rrt_connect_plan(
     T_goal_origin = "goal"
 
     for goal_index, q_goal_candidate in feasible_goals:
-        if edge_is_free(
-            growth_is_free,
-            q_start,
-            q_goal_candidate,
-            resolution=edge_resolution,
-            deadline_s=deadline_s,
-        ):
-            direct_path = [q_start.copy(), q_goal_candidate.copy()]
-            if _path_is_dense_free(
-                direct_path,
-                is_free,
-                edge_resolution=final_validation_edge_resolution,
+        telemetry.direct_edge_checks += 1
+        try:
+            direct_edge_growth_free = edge_is_free(
+                search_is_free,
+                q_start,
+                q_goal_candidate,
+                resolution=edge_resolution,
                 deadline_s=deadline_s,
-            ):
+            )
+        except TimeoutError as exc:
+            _raise_with_telemetry(TimeoutError, str(exc))
+        if direct_edge_growth_free:
+            telemetry.direct_edge_growth_successes += 1
+            direct_path = [q_start.copy(), q_goal_candidate.copy()]
+            try:
+                direct_path_valid = _path_is_dense_free(
+                    direct_path,
+                    is_free,
+                    edge_resolution=final_validation_edge_resolution,
+                    deadline_s=deadline_s,
+                )
+            except TimeoutError as exc:
+                _raise_with_telemetry(TimeoutError, str(exc))
+            if direct_path_valid:
+                telemetry.direct_edge_validation_successes += 1
                 if return_goal_index:
                     return direct_path, goal_index
                 return direct_path
+            telemetry.direct_edge_validation_failures += 1
 
     # define function for sampling since we call it twice every time for each tree (start & goal)
     def sample(active_tree: Tree, passive_tree: Tree):
@@ -880,40 +1026,52 @@ def rrt_connect_plan(
 
     for iter in range(max_iters):
         if deadline_s is not None and time.perf_counter() > float(deadline_s):
-            raise TimeoutError("RRT-Connect timed out before finding a path.")
+            _raise_with_telemetry(TimeoutError, "RRT-Connect timed out before finding a path.")
+        telemetry.iterations = int(iter) + 1
 
         # Sample and reject samples that are in collision
         q_rand = None
         for i in range(max_sample_tries):
             if deadline_s is not None and time.perf_counter() > float(deadline_s):
-                raise TimeoutError("RRT-Connect timed out before finding a path.")
+                _raise_with_telemetry(TimeoutError, "RRT-Connect timed out before finding a path.")
+            telemetry.sample_attempts += 1
             cand = sample(T_start, T_goal)
-            if growth_is_free(cand):
+            if search_is_free(cand):
                 q_rand = cand
+                telemetry.sample_successes += 1
                 break
+            telemetry.sample_rejections += 1
         if q_rand is None:
             continue
 
         # Extend active tree one step toward sample
-        status_start_branch, idx_start_branch = extend_tree(
-            T_start, q_rand, growth_is_free, step_size, edge_resolution,
-            joints_lower_limits, joints_upper_limits,
-            adaptive_step_config=adaptive_step_config,
-            deadline_s=deadline_s,
-        )
-        if status_start_branch != TRAPPED:
-            q_new = T_start.nodes[idx_start_branch]
-
-            # Greedily connect the other tree toward the new node
-            status_goal_branch, idx_goal_branch = connect(
-                T_goal, q_new, growth_is_free, step_size, edge_resolution,
+        try:
+            status_start_branch, idx_start_branch = extend_tree(
+                T_start, q_rand, search_is_free, step_size, edge_resolution,
                 joints_lower_limits, joints_upper_limits,
-                max_connect_steps=max_connect_steps,
                 adaptive_step_config=adaptive_step_config,
                 deadline_s=deadline_s,
             )
+        except TimeoutError as exc:
+            _raise_with_telemetry(TimeoutError, str(exc))
+        if status_start_branch != TRAPPED:
+            telemetry.extend_advanced += 1
+            q_new = T_start.nodes[idx_start_branch]
+
+            # Greedily connect the other tree toward the new node
+            try:
+                status_goal_branch, idx_goal_branch = connect(
+                    T_goal, q_new, search_is_free, step_size, edge_resolution,
+                    joints_lower_limits, joints_upper_limits,
+                    max_connect_steps=max_connect_steps,
+                    adaptive_step_config=adaptive_step_config,
+                    deadline_s=deadline_s,
+                )
+            except TimeoutError as exc:
+                _raise_with_telemetry(TimeoutError, str(exc))
 
             if status_goal_branch == REACHED:
+                telemetry.connect_reached += 1
                 if T_start_origin == "start":
                     path_start_to_conn = trace_path(T_start, idx_start_branch)
                     path_goal_to_conn, goal_root_index = trace_path_with_root_index(
@@ -930,36 +1088,36 @@ def rrt_connect_plan(
 
                 # path_goal_to_conn is root(goal) -> ... -> conn, so reverse it to conn -> ... -> goal
                 path = path_start_to_conn + path_goal_to_conn[::-1][1:]
-                raw_len = len(path)
-                if enable_shortcut:
-                    shortcut_resolution = (
-                        final_validation_edge_resolution
-                        if shortcut_edge_resolution is None else float(shortcut_edge_resolution)
-                    )
-                    path = shortcut_path(
+                telemetry.candidate_paths_found += 1
+                try:
+                    path_valid = _path_is_dense_free(
                         path,
                         is_free,
-                        edge_resolution=shortcut_resolution,
-                        max_passes=shortcut_max_passes,
+                        edge_resolution=final_validation_edge_resolution,
                         deadline_s=deadline_s,
                     )
-                if not _path_is_dense_free(
-                    path,
-                    is_free,
-                    edge_resolution=final_validation_edge_resolution,
-                    deadline_s=deadline_s,
-                ):
+                except TimeoutError as exc:
+                    _raise_with_telemetry(TimeoutError, str(exc))
+                if not path_valid:
+                    telemetry.candidate_paths_rejected_final_validation += 1
                     continue
+                telemetry.finalize(search_start_s)
                 print(
-                    f"RRT-Connect succeeded in {iter} iterations. "
-                    f"Path length: {raw_len} -> {len(path)}"
+                    f"RRT-Connect succeeded in {telemetry.iterations} iterations. "
+                    f"Raw path length: {len(path)}"
                 )
                 if return_goal_index:
                     return path, selected_goal_index
                 return path
+            elif status_goal_branch == TRAPPED:
+                telemetry.connect_trapped += 1
+        else:
+            telemetry.extend_trapped += 1
+        if status_start_branch != TRAPPED and status_goal_branch == ADVANCED:
+            telemetry.connect_advanced += 1
 
         # Swap roles each iteration to advance one another each time
         T_start, T_goal = T_goal, T_start
         T_start_origin, T_goal_origin = T_goal_origin, T_start_origin
 
-    raise RuntimeError("RRT-Connect failed.")
+    _raise_with_telemetry(RuntimeError, "RRT-Connect failed.")

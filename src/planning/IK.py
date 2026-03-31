@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 from pydrake.multibody.inverse_kinematics import InverseKinematics
 from pydrake.math import RotationMatrix
@@ -16,6 +18,8 @@ def solve_iiwa_ik_for_gripper_pose(
     max_soft_starts=8,
     soft_start_sigma=0.08,
     soft_start_random_seed=0,
+    deadline_s=None,
+    log_diagnostics=False,
 ):
     # 1) Clone the ROOT context (so we don't mutate simulator state and because it errors otherwise)
     ik_root_context = root_context_current.Clone()
@@ -139,6 +143,8 @@ def solve_iiwa_ik_for_gripper_pose(
 
     # Solve from each soft start, return immediately on first success.
     for attempt_idx, q_guess_iiwa in enumerate(soft_start_guesses, start=1):
+        if deadline_s is not None and time.perf_counter() > float(deadline_s):
+            raise TimeoutError("IK exceeded its planning deadline")
         q_guess_all = q0_all.copy()
         q_guess_all[iiwa_position_indices] = q_guess_iiwa
         prog.SetInitialGuess(q, q_guess_all)
@@ -146,14 +152,16 @@ def solve_iiwa_ik_for_gripper_pose(
         if result.is_success():
             q_sol = result.GetSolution(q)
             plant.SetPositions(plant_context, q_sol)
-            print(f"IK succeeded on soft-start attempt {attempt_idx}/{len(soft_start_guesses)}")
+            if bool(log_diagnostics):
+                print(f"IK succeeded on soft-start attempt {attempt_idx}/{len(soft_start_guesses)}")
             return plant.GetPositions(plant_context, iiwa_instance).copy()
 
-    print(f"IK failed after {len(soft_start_guesses)} soft-start attempts")
-    print("Solver:", result.get_solver_id().name())
-    print("SolutionResult:", result.get_solution_result())
-    try:
-        print("InfeasibleConstraintNames:", result.GetInfeasibleConstraintNames(prog))
-    except Exception as e:
-        print("Infeasible-constraint reporting unavailable:", e)
+    if bool(log_diagnostics):
+        print(f"IK failed after {len(soft_start_guesses)} soft-start attempts")
+        print("Solver:", result.get_solver_id().name())
+        print("SolutionResult:", result.get_solution_result())
+        try:
+            print("InfeasibleConstraintNames:", result.GetInfeasibleConstraintNames(prog))
+        except Exception as e:
+            print("Infeasible-constraint reporting unavailable:", e)
     raise RuntimeError("IK Optimization failed across all soft starts")

@@ -8,7 +8,12 @@ from pydrake.math import RigidTransform, RollPitchYaw, RotationMatrix
 
 from src.manipulation.grasp import GraspOptions, GraspPrimitivePlan, plan_grasp_primitive
 from src.planning.IK import solve_iiwa_ik_for_gripper_pose
-from src.planning.rrt_connect import RRTConnectConfig, edge_is_free, rrt_connect_plan
+from src.planning.rrt_connect import (
+    RRTConnectConfig,
+    edge_is_free,
+    postprocess_rrt_path,
+    rrt_connect_plan,
+)
 
 
 class ManipulationState(str, enum.Enum):
@@ -29,12 +34,17 @@ class ManipulationOptions:
     position_tol: float = 0.002
     theta_tol: float = 0.035
     ik_soft_starts: int = 20
+    local_ik_soft_starts: int = 4
     ik_soft_start_sigma: float = 0.08
     ik_soft_start_seed: int = 0
     rrt: RRTConnectConfig = dc.field(default_factory=RRTConnectConfig)
     max_planning_time_s: float | None = 60.0
+    home_to_pregrasp_time_budget_s: float | None = None
+    grasp_primitive_time_budget_s: float | None = None
+    pregrasp_to_drop_time_budget_s: float | None = None
     drop_candidate_time_budget_s: float | None = 8.0
     max_drop_candidates: int | None = 20
+    drop_rrt_candidate_batch_sizes: tuple[int, ...] = (1, 5, 20)
     enable_carry_escape: bool = True
     carry_escape_clearance_threshold_m: float | None = None
     carry_escape_try_home_staging: bool = True
@@ -57,7 +67,7 @@ class ManipulationOptions:
         (0.0, -0.03),
     )
     drop_z_offsets_m: tuple[float, ...] = (0.0, 0.03, 0.06, 0.10)
-    drop_yaw_offsets_rad: tuple[float, ...] = (0.0, 0.20, -0.20)
+    drop_yaw_offsets_rad: tuple[float, ...] = (0.0, 0.035, -0.035)
     grasp_options: GraspOptions = dc.field(default_factory=GraspOptions)
 
 
@@ -90,6 +100,12 @@ class AxialClearancePathResult:
     path: list[np.ndarray]
     final_clearance_m: float | None
     stop_reason: str
+
+
+@dc.dataclass
+class DropTransportSharedBridges:
+    bridge2_configs: list[tuple[float, np.ndarray, bool]]
+    bridge1_configs: dict[float, list[np.ndarray]]
 
 
 def build_axial_clearance_path(
@@ -297,19 +313,92 @@ class ManipulationFSM:
         q_start: np.ndarray,
         q_goal: np.ndarray,
         is_free_fn: typing.Callable[[np.ndarray], bool] | None = None,
+        search_is_free_fn: typing.Callable[[np.ndarray], bool] | None = None,
         planning_deadline_s: float | None = None,
         return_goal_index: bool = False,
+        debug_label: str | None = None,
     ) -> list[np.ndarray] | tuple[list[np.ndarray], int]:
         is_free_fn = is_free_fn or self.is_free
-        return rrt_connect_plan(
-            q_start=q_start,
-            q_goal=q_goal,
-            is_free=is_free_fn,
-            joints_lower_limits=self.joints_lower_limits,
-            joints_upper_limits=self.joints_upper_limits,
-            **self.options.rrt.to_plan_kwargs(deadline_s=planning_deadline_s),
-            return_goal_index=return_goal_index,
+        try:
+            result = rrt_connect_plan(
+                q_start=q_start,
+                q_goal=q_goal,
+                is_free=is_free_fn,
+                search_is_free=search_is_free_fn,
+                joints_lower_limits=self.joints_lower_limits,
+                joints_upper_limits=self.joints_upper_limits,
+                **self.options.rrt.to_plan_kwargs(deadline_s=planning_deadline_s),
+                return_goal_index=return_goal_index,
+            )
+        except Exception as exc:
+            if debug_label is None:
+                raise
+            raise type(exc)(f"{debug_label}: {exc}") from exc
+        if return_goal_index:
+            raw_path, goal_index = result
+            return (
+                postprocess_rrt_path(
+                    raw_path,
+                    is_free_fn,
+                    planner_config=self.options.rrt,
+                    deadline_s=planning_deadline_s,
+                ),
+                goal_index,
+            )
+        return postprocess_rrt_path(
+            result,
+            is_free_fn,
+            planner_config=self.options.rrt,
+            deadline_s=planning_deadline_s,
         )
+
+    @staticmethod
+    def _resolve_stage_deadline(
+        planning_deadline_s: float | None,
+        *,
+        stage_start_s: float,
+        stage_budget_s: float | None,
+    ) -> float | None:
+        stage_deadline_s = planning_deadline_s
+        if stage_budget_s is not None:
+            local_deadline_s = stage_start_s + max(0.0, float(stage_budget_s))
+            if stage_deadline_s is None:
+                stage_deadline_s = local_deadline_s
+            else:
+                stage_deadline_s = min(stage_deadline_s, local_deadline_s)
+        return stage_deadline_s
+
+    @staticmethod
+    def _check_stage_deadline(
+        stage_name: str,
+        *,
+        planning_deadline_s: float | None,
+        stage_deadline_s: float | None,
+        stage_budget_s: float | None,
+    ) -> None:
+        if stage_deadline_s is None or time.perf_counter() <= float(stage_deadline_s):
+            return
+        if (
+            stage_budget_s is not None
+            and (
+                planning_deadline_s is None
+                or float(stage_deadline_s) < float(planning_deadline_s) - 1e-12
+            )
+        ):
+            raise TimeoutError(
+                f"{stage_name} exceeded stage budget of {float(stage_budget_s):.1f}s"
+            )
+        raise TimeoutError("Planning exceeded the overall planning deadline")
+
+    @staticmethod
+    def _raise_if_deadline_exceeded(
+        deadline_s: float | None,
+        *,
+        context: str,
+    ) -> None:
+        if deadline_s is None or time.perf_counter() <= float(deadline_s):
+            return
+        raise TimeoutError(f"{context} exceeded its planning deadline")
 
     def _iter_drop_candidates(self, X_WG_drop: RigidTransform):
         p_WG_nominal = X_WG_drop.translation()
@@ -423,12 +512,10 @@ class ManipulationFSM:
         )
 
         def _check_deadline() -> None:
-            if planning_deadline_s is not None and time.perf_counter() > float(
-                planning_deadline_s
-            ):
-                raise TimeoutError(
-                    f"Planning exceeded time budget of {self.options.max_planning_time_s:.1f}s"
-                )
+            self._raise_if_deadline_exceeded(
+                planning_deadline_s,
+                context="axial_clearance_path",
+            )
 
         def _solve_step(
             pullback_m: float,
@@ -449,11 +536,12 @@ class ManipulationFSM:
                 q_iiwa_seed=q_seed,
                 position_tol=self.options.position_tol,
                 theta_tol=self.options.theta_tol,
-                max_soft_starts=self.options.ik_soft_starts,
+                max_soft_starts=self.options.local_ik_soft_starts,
                 soft_start_sigma=self.options.ik_soft_start_sigma,
                 soft_start_random_seed=(
                     self.options.ik_soft_start_seed + soft_start_seed_base + step_index
                 ),
+                deadline_s=planning_deadline_s,
             )
 
         def _state_is_free(q: np.ndarray) -> bool:
@@ -595,6 +683,7 @@ class ManipulationFSM:
         X_WG_target: RigidTransform,
         q_seed: np.ndarray,
         soft_start_seed: int,
+        planning_deadline_s: float | None = None,
     ) -> np.ndarray:
         q_target = solve_iiwa_ik_for_gripper_pose(
             plant=self.plant,
@@ -605,22 +694,21 @@ class ManipulationFSM:
             q_iiwa_seed=q_seed,
             position_tol=self.options.position_tol,
             theta_tol=self.options.theta_tol,
-            max_soft_starts=self.options.ik_soft_starts,
+            max_soft_starts=self.options.local_ik_soft_starts,
             soft_start_sigma=self.options.ik_soft_start_sigma,
             soft_start_random_seed=soft_start_seed,
+            deadline_s=planning_deadline_s,
         )
         return np.asarray(q_target, dtype=float).reshape(7)
 
-    def _try_deterministic_drop_transport(
+    def _compute_shared_drop_transport_bridges(
         self,
         q_transit_start: np.ndarray,
-        path_carry_escape: list[np.ndarray],
         X_WG_drop_reference: RigidTransform,
-        feasible_drop_candidates: list[tuple[int, RigidTransform, np.ndarray, np.ndarray, list[np.ndarray]]],
         planning_deadline_s: float | None = None,
-    ) -> tuple[np.ndarray, list[np.ndarray], int, RigidTransform] | None:
+    ) -> DropTransportSharedBridges:
         if not bool(self.options.enable_drop_transport_bridges):
-            return None
+            return DropTransportSharedBridges(bridge2_configs=[], bridge1_configs={})
 
         q_transit_start = np.asarray(q_transit_start, dtype=float).reshape(7)
         shared_bridge2_configs: list[tuple[float, np.ndarray, bool]] = []
@@ -630,15 +718,16 @@ class ManipulationFSM:
                 self.options.drop_transport_bridge_high_z_offset_m,
             )
         ):
-            if planning_deadline_s is not None and time.perf_counter() > float(planning_deadline_s):
-                raise TimeoutError(
-                    f"Planning exceeded time budget of {self.options.max_planning_time_s:.1f}s"
-                )
+            self._raise_if_deadline_exceeded(
+                planning_deadline_s,
+                context="deterministic_drop_transport",
+            )
             try:
                 q_bridge2 = self._solve_carry_pose_ik(
                     X_WG_bridge2,
                     q_seed=q_transit_start,
                     soft_start_seed=self.options.ik_soft_start_seed + 20_000 + bridge2_index,
+                    planning_deadline_s=planning_deadline_s,
                 )
             except Exception:
                 continue
@@ -664,15 +753,16 @@ class ManipulationFSM:
                 self.options.drop_transport_bridge_low_z_offset_m,
             )
         ):
-            if planning_deadline_s is not None and time.perf_counter() > float(planning_deadline_s):
-                raise TimeoutError(
-                    f"Planning exceeded time budget of {self.options.max_planning_time_s:.1f}s"
-                )
+            self._raise_if_deadline_exceeded(
+                planning_deadline_s,
+                context="deterministic_drop_transport",
+            )
             try:
                 q_bridge1 = self._solve_carry_pose_ik(
                     X_WG_bridge1,
                     q_seed=q_transit_start,
                     soft_start_seed=self.options.ik_soft_start_seed + 30_000 + bridge1_index,
+                    planning_deadline_s=planning_deadline_s,
                 )
             except Exception:
                 continue
@@ -687,152 +777,63 @@ class ManipulationFSM:
                 continue
             shared_bridge1_configs.setdefault(bridge_backoff_m, []).append(q_bridge1.copy())
 
-        for goal_slot, candidate in enumerate(feasible_drop_candidates):
-            if planning_deadline_s is not None and time.perf_counter() > float(planning_deadline_s):
-                raise TimeoutError(
-                    f"Planning exceeded time budget of {self.options.max_planning_time_s:.1f}s"
-                )
-            candidate_index, X_WG_drop_candidate, q_drop_candidate, q_transit_goal, insertion_path = candidate
-            q_transit_goal = np.asarray(q_transit_goal, dtype=float).reshape(7)
+        return DropTransportSharedBridges(
+            bridge2_configs=shared_bridge2_configs,
+            bridge1_configs=shared_bridge1_configs,
+        )
 
-            if self._strict_edge_is_free(
-                q_transit_start,
+    def _try_deterministic_drop_transport(
+        self,
+        q_transit_start: np.ndarray,
+        path_carry_escape: list[np.ndarray],
+        candidate: tuple[int, RigidTransform, np.ndarray, np.ndarray, list[np.ndarray]],
+        shared_bridges: DropTransportSharedBridges,
+        planning_deadline_s: float | None = None,
+    ) -> tuple[np.ndarray, list[np.ndarray], int, RigidTransform] | None:
+        if not bool(self.options.enable_drop_transport_bridges):
+            return None
+
+        q_transit_start = np.asarray(q_transit_start, dtype=float).reshape(7)
+        self._raise_if_deadline_exceeded(
+            planning_deadline_s,
+            context="deterministic_drop_transport",
+        )
+        candidate_index, X_WG_drop_candidate, q_drop_candidate, q_transit_goal, insertion_path = candidate
+        q_transit_goal = np.asarray(q_transit_goal, dtype=float).reshape(7)
+
+        if self._strict_edge_is_free(
+            q_transit_start,
+            q_transit_goal,
+            self.is_free_carry,
+            planning_deadline_s=planning_deadline_s,
+        ):
+            return (
+                np.asarray(q_drop_candidate, dtype=float).copy(),
+                self._merge_joint_paths(path_carry_escape, [q_transit_goal], insertion_path),
+                int(candidate_index),
+                X_WG_drop_candidate,
+            )
+
+        for bridge_backoff_m, q_bridge2, start_to_bridge2 in shared_bridges.bridge2_configs:
+            if not self._strict_edge_is_free(
+                q_bridge2,
                 q_transit_goal,
                 self.is_free_carry,
                 planning_deadline_s=planning_deadline_s,
             ):
+                continue
+            if start_to_bridge2:
                 return (
                     np.asarray(q_drop_candidate, dtype=float).copy(),
-                    self._merge_joint_paths(path_carry_escape, [q_transit_goal], insertion_path),
+                    self._merge_joint_paths(
+                        path_carry_escape,
+                        [q_bridge2, q_transit_goal],
+                        insertion_path,
+                    ),
                     int(candidate_index),
                     X_WG_drop_candidate,
                 )
-
-            for bridge_backoff_m, q_bridge2, start_to_bridge2 in shared_bridge2_configs:
-                if not self._strict_edge_is_free(
-                    q_bridge2,
-                    q_transit_goal,
-                    self.is_free_carry,
-                    planning_deadline_s=planning_deadline_s,
-                ):
-                    continue
-                if start_to_bridge2:
-                    return (
-                        np.asarray(q_drop_candidate, dtype=float).copy(),
-                        self._merge_joint_paths(
-                            path_carry_escape,
-                            [q_bridge2, q_transit_goal],
-                            insertion_path,
-                        ),
-                        int(candidate_index),
-                        X_WG_drop_candidate,
-                    )
-                for q_bridge1 in shared_bridge1_configs.get(bridge_backoff_m, []):
-                    if not self._strict_edge_is_free(
-                        q_bridge1,
-                        q_bridge2,
-                        self.is_free_carry,
-                        planning_deadline_s=planning_deadline_s,
-                    ):
-                        continue
-                    return (
-                        np.asarray(q_drop_candidate, dtype=float).copy(),
-                        self._merge_joint_paths(
-                            path_carry_escape,
-                            [q_bridge1, q_bridge2, q_transit_goal],
-                            insertion_path,
-                        ),
-                        int(candidate_index),
-                        X_WG_drop_candidate,
-                    )
-
-            bridge2_cache: dict[float, np.ndarray] = {}
-            for bridge2_index, (bridge_backoff_m, X_WG_bridge2) in enumerate(
-                self._iter_drop_transport_bridge_poses(
-                    X_WG_drop_candidate,
-                    self.options.drop_transport_bridge_high_z_offset_m,
-                )
-            ):
-                if planning_deadline_s is not None and time.perf_counter() > float(planning_deadline_s):
-                    raise TimeoutError(
-                        f"Planning exceeded time budget of {self.options.max_planning_time_s:.1f}s"
-                    )
-                try:
-                    q_bridge2 = self._solve_carry_pose_ik(
-                        X_WG_bridge2,
-                        q_seed=q_transit_goal,
-                        soft_start_seed=(
-                            self.options.ik_soft_start_seed
-                            + 20_000
-                            + 200 * candidate_index
-                            + bridge2_index
-                        ),
-                    )
-                except Exception:
-                    continue
-                if not self.is_free_carry(q_bridge2):
-                    continue
-                if not self._strict_edge_is_free(
-                    q_bridge2,
-                    q_transit_goal,
-                    self.is_free_carry,
-                    planning_deadline_s=planning_deadline_s,
-                ):
-                    continue
-                bridge2_cache[bridge_backoff_m] = q_bridge2.copy()
-
-                if self._strict_edge_is_free(
-                    q_transit_start,
-                    q_bridge2,
-                    self.is_free_carry,
-                    planning_deadline_s=planning_deadline_s,
-                ):
-                    return (
-                        np.asarray(q_drop_candidate, dtype=float).copy(),
-                        self._merge_joint_paths(
-                            path_carry_escape,
-                            [q_bridge2, q_transit_goal],
-                            insertion_path,
-                        ),
-                        int(candidate_index),
-                        X_WG_drop_candidate,
-                    )
-
-            for bridge1_index, (bridge_backoff_m, X_WG_bridge1) in enumerate(
-                self._iter_drop_transport_bridge_poses(
-                    X_WG_drop_candidate,
-                    self.options.drop_transport_bridge_low_z_offset_m,
-                )
-            ):
-                if bridge_backoff_m not in bridge2_cache:
-                    continue
-                if planning_deadline_s is not None and time.perf_counter() > float(planning_deadline_s):
-                    raise TimeoutError(
-                        f"Planning exceeded time budget of {self.options.max_planning_time_s:.1f}s"
-                    )
-                try:
-                    q_bridge1 = self._solve_carry_pose_ik(
-                        X_WG_bridge1,
-                        q_seed=q_transit_start,
-                        soft_start_seed=(
-                            self.options.ik_soft_start_seed
-                            + 30_000
-                            + 200 * candidate_index
-                            + bridge1_index
-                        ),
-                    )
-                except Exception:
-                    continue
-                if not self.is_free_carry(q_bridge1):
-                    continue
-                if not self._strict_edge_is_free(
-                    q_transit_start,
-                    q_bridge1,
-                    self.is_free_carry,
-                    planning_deadline_s=planning_deadline_s,
-                ):
-                    continue
-                q_bridge2 = bridge2_cache[bridge_backoff_m]
+            for q_bridge1 in shared_bridges.bridge1_configs.get(bridge_backoff_m, []):
                 if not self._strict_edge_is_free(
                     q_bridge1,
                     q_bridge2,
@@ -851,6 +852,113 @@ class ManipulationFSM:
                     X_WG_drop_candidate,
                 )
 
+        bridge2_cache: dict[float, np.ndarray] = {}
+        for bridge2_index, (bridge_backoff_m, X_WG_bridge2) in enumerate(
+            self._iter_drop_transport_bridge_poses(
+                X_WG_drop_candidate,
+                self.options.drop_transport_bridge_high_z_offset_m,
+            )
+        ):
+            self._raise_if_deadline_exceeded(
+                planning_deadline_s,
+                context="deterministic_drop_transport",
+            )
+            try:
+                q_bridge2 = self._solve_carry_pose_ik(
+                    X_WG_bridge2,
+                    q_seed=q_transit_goal,
+                    soft_start_seed=(
+                        self.options.ik_soft_start_seed
+                        + 20_000
+                        + 200 * candidate_index
+                        + bridge2_index
+                    ),
+                    planning_deadline_s=planning_deadline_s,
+                )
+            except Exception:
+                continue
+            if not self.is_free_carry(q_bridge2):
+                continue
+            if not self._strict_edge_is_free(
+                q_bridge2,
+                q_transit_goal,
+                self.is_free_carry,
+                planning_deadline_s=planning_deadline_s,
+            ):
+                continue
+            bridge2_cache[bridge_backoff_m] = q_bridge2.copy()
+
+            if self._strict_edge_is_free(
+                q_transit_start,
+                q_bridge2,
+                self.is_free_carry,
+                planning_deadline_s=planning_deadline_s,
+            ):
+                return (
+                    np.asarray(q_drop_candidate, dtype=float).copy(),
+                    self._merge_joint_paths(
+                        path_carry_escape,
+                        [q_bridge2, q_transit_goal],
+                        insertion_path,
+                    ),
+                    int(candidate_index),
+                    X_WG_drop_candidate,
+                )
+
+        for bridge1_index, (bridge_backoff_m, X_WG_bridge1) in enumerate(
+            self._iter_drop_transport_bridge_poses(
+                X_WG_drop_candidate,
+                self.options.drop_transport_bridge_low_z_offset_m,
+            )
+        ):
+            if bridge_backoff_m not in bridge2_cache:
+                continue
+            self._raise_if_deadline_exceeded(
+                planning_deadline_s,
+                context="deterministic_drop_transport",
+            )
+            try:
+                q_bridge1 = self._solve_carry_pose_ik(
+                    X_WG_bridge1,
+                    q_seed=q_transit_start,
+                    soft_start_seed=(
+                        self.options.ik_soft_start_seed
+                        + 30_000
+                        + 200 * candidate_index
+                        + bridge1_index
+                    ),
+                    planning_deadline_s=planning_deadline_s,
+                )
+            except Exception:
+                continue
+            if not self.is_free_carry(q_bridge1):
+                continue
+            if not self._strict_edge_is_free(
+                q_transit_start,
+                q_bridge1,
+                self.is_free_carry,
+                planning_deadline_s=planning_deadline_s,
+            ):
+                continue
+            q_bridge2 = bridge2_cache[bridge_backoff_m]
+            if not self._strict_edge_is_free(
+                q_bridge1,
+                q_bridge2,
+                self.is_free_carry,
+                planning_deadline_s=planning_deadline_s,
+            ):
+                continue
+            return (
+                np.asarray(q_drop_candidate, dtype=float).copy(),
+                self._merge_joint_paths(
+                    path_carry_escape,
+                    [q_bridge1, q_bridge2, q_transit_goal],
+                    insertion_path,
+                ),
+                int(candidate_index),
+                X_WG_drop_candidate,
+            )
+
         return None
 
     def run(
@@ -866,17 +974,23 @@ class ManipulationFSM:
         if self.options.max_planning_time_s is not None:
             planning_deadline_s = planning_start + float(self.options.max_planning_time_s)
 
-        def _check_planning_deadline() -> None:
-            if planning_deadline_s is not None and time.perf_counter() > planning_deadline_s:
-                raise TimeoutError(f"Planning exceeded time budget of {self.options.max_planning_time_s:.1f}s")
-
         q_home = np.asarray(q_home, dtype=float).reshape(7)
         self._transition(ManipulationState.HOME_READY)
 
         try:
             self._transition(ManipulationState.PLAN_HOME_TO_PREGRASP)
             phase_start = time.perf_counter()
-            _check_planning_deadline()
+            home_deadline_s = self._resolve_stage_deadline(
+                planning_deadline_s,
+                stage_start_s=phase_start,
+                stage_budget_s=self.options.home_to_pregrasp_time_budget_s,
+            )
+            self._check_stage_deadline(
+                "home_to_pregrasp",
+                planning_deadline_s=planning_deadline_s,
+                stage_deadline_s=home_deadline_s,
+                stage_budget_s=self.options.home_to_pregrasp_time_budget_s,
+            )
             q_pregrasp = solve_iiwa_ik_for_gripper_pose(
                 plant=self.plant,
                 root_context_current=self.root_context_current,
@@ -889,17 +1003,32 @@ class ManipulationFSM:
                 max_soft_starts=self.options.ik_soft_starts,
                 soft_start_sigma=self.options.ik_soft_start_sigma,
                 soft_start_random_seed=self.options.ik_soft_start_seed,
+                deadline_s=home_deadline_s,
             )
             if not self.is_free(q_pregrasp):
                 raise RuntimeError("Pregrasp IK solution is not collision free")
             path_home_to_pregrasp = self._plan_rrt(
-                q_home, q_pregrasp, planning_deadline_s=planning_deadline_s
+                q_home,
+                q_pregrasp,
+                search_is_free_fn=self.is_free,
+                planning_deadline_s=home_deadline_s,
+                debug_label="home_to_pregrasp",
             )
             timings_s["plan_home_to_pregrasp"] = time.perf_counter() - phase_start
 
             self._transition(ManipulationState.RUN_GRASP_PRIMITIVE)
             phase_start = time.perf_counter()
-            _check_planning_deadline()
+            grasp_deadline_s = self._resolve_stage_deadline(
+                planning_deadline_s,
+                stage_start_s=phase_start,
+                stage_budget_s=self.options.grasp_primitive_time_budget_s,
+            )
+            self._check_stage_deadline(
+                "grasp_primitive",
+                planning_deadline_s=planning_deadline_s,
+                stage_deadline_s=grasp_deadline_s,
+                stage_budget_s=self.options.grasp_primitive_time_budget_s,
+            )
             grasp_result = plan_grasp_primitive(
                 plant=self.plant,
                 root_context_current=self.root_context_current,
@@ -914,7 +1043,7 @@ class ManipulationFSM:
                 options=self.options.grasp_options,
                 is_free_retreat=self.is_free_deapproach,
                 prepare_retreat_checker=self._configure_carry_payload_attachment,
-                planning_deadline_s=planning_deadline_s,
+                planning_deadline_s=grasp_deadline_s,
             )
             timings_s["plan_grasp_primitive"] = time.perf_counter() - phase_start
             if not grasp_result.success or grasp_result.plan is None:
@@ -927,11 +1056,22 @@ class ManipulationFSM:
 
             self._transition(ManipulationState.PLAN_PREGRASP_TO_DROP)
             phase_start = time.perf_counter()
+            drop_deadline_s = self._resolve_stage_deadline(
+                planning_deadline_s,
+                stage_start_s=phase_start,
+                stage_budget_s=self.options.pregrasp_to_drop_time_budget_s,
+            )
+            self._check_stage_deadline(
+                "pregrasp_to_drop",
+                planning_deadline_s=planning_deadline_s,
+                stage_deadline_s=drop_deadline_s,
+                stage_budget_s=self.options.pregrasp_to_drop_time_budget_s,
+            )
             carry_escape_start = time.perf_counter()
             path_carry_escape, q_drop_rrt_start = self._plan_carry_escape_prefix(
                 q_home=q_home,
                 q_postgrasp_retreat=grasp_plan.q_postgrasp_retreat,
-                planning_deadline_s=planning_deadline_s,
+                planning_deadline_s=drop_deadline_s,
             )
             timings_s["plan_carry_escape"] = time.perf_counter() - carry_escape_start
             q_drop = None
@@ -943,8 +1083,98 @@ class ManipulationFSM:
             feasible_drop_candidates: list[
                 tuple[int, RigidTransform, np.ndarray, np.ndarray, list[np.ndarray]]
             ] = []
+            shared_drop_transport_bridges: DropTransportSharedBridges | None = None
+            drop_rrt_batch_sizes = tuple(
+                max(1, int(batch_size))
+                for batch_size in self.options.drop_rrt_candidate_batch_sizes
+            )
+            next_drop_rrt_batch_index = 0
+
+            def _resolve_drop_candidate_deadline() -> float | None:
+                candidate_deadline_s = drop_deadline_s
+                if self.options.drop_candidate_time_budget_s is not None:
+                    local_deadline_s = (
+                        time.perf_counter() + float(self.options.drop_candidate_time_budget_s)
+                    )
+                    if candidate_deadline_s is None:
+                        candidate_deadline_s = local_deadline_s
+                    else:
+                        candidate_deadline_s = min(candidate_deadline_s, local_deadline_s)
+                return candidate_deadline_s
+
+            def _attempt_drop_rrt(force: bool = False) -> bool:
+                nonlocal next_drop_rrt_batch_index
+                nonlocal q_drop
+                nonlocal path_pregrasp_to_drop
+                nonlocal drop_candidate_index
+                nonlocal X_WG_drop_selected
+
+                if not feasible_drop_candidates:
+                    return False
+
+                while next_drop_rrt_batch_index < len(drop_rrt_batch_sizes):
+                    batch_size = min(
+                        int(drop_rrt_batch_sizes[next_drop_rrt_batch_index]),
+                        len(feasible_drop_candidates),
+                    )
+                    if not force and len(feasible_drop_candidates) < int(
+                        drop_rrt_batch_sizes[next_drop_rrt_batch_index]
+                    ):
+                        return False
+
+                    candidate_deadline_s = _resolve_drop_candidate_deadline()
+                    try:
+                        q_drop_candidates = [
+                            candidate[3] for candidate in feasible_drop_candidates[:batch_size]
+                        ]
+                        path_candidate, selected_goal_slot = self._plan_rrt(
+                            q_drop_rrt_start,
+                            q_drop_candidates,
+                            is_free_fn=self.is_free_carry,
+                            planning_deadline_s=candidate_deadline_s,
+                            return_goal_index=True,
+                            debug_label=f"drop_candidates_multi_goal_batch_{batch_size}",
+                        )
+                    except TimeoutError:
+                        drop_failures.append(
+                            f"drop_candidates_multi_goal_batch_{batch_size}: RRT timeout"
+                        )
+                    except Exception as exc:
+                        drop_failures.append(
+                            f"drop_candidates_multi_goal_batch_{batch_size}: {exc}"
+                        )
+                    else:
+                        (
+                            selected_candidate_index,
+                            selected_drop_pose,
+                            selected_q_drop,
+                            _selected_transit_goal,
+                            selected_insertion_path,
+                        ) = feasible_drop_candidates[int(selected_goal_slot)]
+                        q_drop = np.asarray(selected_q_drop, dtype=float).copy()
+                        path_pregrasp_to_drop = self._merge_joint_paths(
+                            path_carry_escape,
+                            path_candidate,
+                            selected_insertion_path,
+                        )
+                        drop_candidate_index = int(selected_candidate_index)
+                        X_WG_drop_selected = selected_drop_pose
+                        next_drop_rrt_batch_index += 1
+                        return True
+
+                    next_drop_rrt_batch_index += 1
+                    if not force:
+                        return False
+
+                return False
+
             for candidate_index, X_WG_drop_candidate in self._iter_drop_candidates(X_WG_drop):
-                _check_planning_deadline()
+                self._check_stage_deadline(
+                    "pregrasp_to_drop",
+                    planning_deadline_s=planning_deadline_s,
+                    stage_deadline_s=drop_deadline_s,
+                    stage_budget_s=self.options.pregrasp_to_drop_time_budget_s,
+                )
                 if (
                     self.options.max_drop_candidates is not None
                     and drop_candidates_tried >= int(self.options.max_drop_candidates)
@@ -964,6 +1194,7 @@ class ManipulationFSM:
                         max_soft_starts=self.options.ik_soft_starts,
                         soft_start_sigma=self.options.ik_soft_start_sigma,
                         soft_start_random_seed=self.options.ik_soft_start_seed + 100 + candidate_index,
+                        deadline_s=drop_deadline_s,
                     )
                     if not self.is_free_carry(q_drop_candidate):
                         drop_failures.append(
@@ -974,31 +1205,39 @@ class ManipulationFSM:
                         candidate_index=candidate_index,
                         X_WG_drop_candidate=X_WG_drop_candidate,
                         q_drop_candidate=q_drop_candidate,
-                        planning_deadline_s=planning_deadline_s,
+                        planning_deadline_s=drop_deadline_s,
                     )
-                    feasible_drop_candidates.append(
-                        (
-                            candidate_index,
-                            X_WG_drop_candidate,
-                            np.asarray(q_drop_candidate, dtype=float).copy(),
-                            np.asarray(q_drop_transit_goal, dtype=float).copy(),
-                            [np.asarray(q, dtype=float).copy() for q in insertion_path],
+                    candidate = (
+                        candidate_index,
+                        X_WG_drop_candidate,
+                        np.asarray(q_drop_candidate, dtype=float).copy(),
+                        np.asarray(q_drop_transit_goal, dtype=float).copy(),
+                        [np.asarray(q, dtype=float).copy() for q in insertion_path],
+                    )
+                    feasible_drop_candidates.append(candidate)
+                    if bool(self.options.enable_drop_transport_bridges):
+                        if shared_drop_transport_bridges is None:
+                            shared_drop_transport_bridges = self._compute_shared_drop_transport_bridges(
+                                q_transit_start=q_drop_rrt_start,
+                                X_WG_drop_reference=X_WG_drop,
+                                planning_deadline_s=drop_deadline_s,
+                            )
+                        deterministic_drop = self._try_deterministic_drop_transport(
+                            q_transit_start=q_drop_rrt_start,
+                            path_carry_escape=path_carry_escape,
+                            candidate=candidate,
+                            shared_bridges=shared_drop_transport_bridges,
+                            planning_deadline_s=drop_deadline_s,
                         )
-                    )
-                    deterministic_drop = self._try_deterministic_drop_transport(
-                        q_transit_start=q_drop_rrt_start,
-                        path_carry_escape=path_carry_escape,
-                        X_WG_drop_reference=X_WG_drop,
-                        feasible_drop_candidates=feasible_drop_candidates,
-                        planning_deadline_s=planning_deadline_s,
-                    )
-                    if deterministic_drop is not None:
-                        (
-                            q_drop,
-                            path_pregrasp_to_drop,
-                            drop_candidate_index,
-                            X_WG_drop_selected,
-                        ) = deterministic_drop
+                        if deterministic_drop is not None:
+                            (
+                                q_drop,
+                                path_pregrasp_to_drop,
+                                drop_candidate_index,
+                                X_WG_drop_selected,
+                            ) = deterministic_drop
+                            break
+                    if _attempt_drop_rrt(force=False):
                         break
                 except TimeoutError:
                     drop_failures.append(f"drop_candidate_{candidate_index}: planning timeout")
@@ -1006,60 +1245,7 @@ class ManipulationFSM:
                     drop_failures.append(f"drop_candidate_{candidate_index}: {exc}")
 
             if q_drop is None and feasible_drop_candidates:
-                candidate_deadline_s = planning_deadline_s
-                if self.options.drop_candidate_time_budget_s is not None:
-                    local_deadline_s = (
-                        time.perf_counter() + float(self.options.drop_candidate_time_budget_s)
-                    )
-                    if candidate_deadline_s is None:
-                        candidate_deadline_s = local_deadline_s
-                    else:
-                        candidate_deadline_s = min(candidate_deadline_s, local_deadline_s)
-                try:
-                    deterministic_drop = self._try_deterministic_drop_transport(
-                        q_transit_start=q_drop_rrt_start,
-                        path_carry_escape=path_carry_escape,
-                        X_WG_drop_reference=X_WG_drop,
-                        feasible_drop_candidates=feasible_drop_candidates,
-                        planning_deadline_s=candidate_deadline_s,
-                    )
-                    if deterministic_drop is not None:
-                        (
-                            q_drop,
-                            path_pregrasp_to_drop,
-                            drop_candidate_index,
-                            X_WG_drop_selected,
-                        ) = deterministic_drop
-                    else:
-                        q_drop_candidates = [candidate[3] for candidate in feasible_drop_candidates]
-                        path_candidate, selected_goal_slot = self._plan_rrt(
-                            q_drop_rrt_start,
-                            q_drop_candidates,
-                            is_free_fn=self.is_free_carry,
-                            planning_deadline_s=candidate_deadline_s,
-                            return_goal_index=True,
-                        )
-                        (
-                            selected_candidate_index,
-                            selected_drop_pose,
-                            selected_q_drop,
-                            _selected_transit_goal,
-                            selected_insertion_path,
-                        ) = feasible_drop_candidates[
-                            int(selected_goal_slot)
-                        ]
-                        q_drop = np.asarray(selected_q_drop, dtype=float).copy()
-                        path_pregrasp_to_drop = self._merge_joint_paths(
-                            path_carry_escape,
-                            path_candidate,
-                            selected_insertion_path,
-                        )
-                        drop_candidate_index = int(selected_candidate_index)
-                        X_WG_drop_selected = selected_drop_pose
-                except TimeoutError:
-                    drop_failures.append("drop_candidates_multi_goal: RRT timeout")
-                except Exception as exc:
-                    drop_failures.append(f"drop_candidates_multi_goal: {exc}")
+                _attempt_drop_rrt(force=True)
 
             timings_s["plan_pregrasp_to_drop"] = time.perf_counter() - phase_start
             timings_s["drop_candidates_tried"] = float(drop_candidates_tried)
