@@ -65,7 +65,7 @@ class RRTConnectConfig:
     shortcut_max_attempts: int | None = 128
     shortcut_time_budget_s: float | None = 1.0
     final_validation_edge_resolution: float | None = 0.03
-    random_seed: int | None = None
+    random_seed: int | None = 0
     adaptive_step_config: AdaptiveStepConfig = dc.field(
         default_factory=lambda: AdaptiveStepConfig(
             enabled=True,

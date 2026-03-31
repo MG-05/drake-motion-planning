@@ -340,7 +340,7 @@ def main():
         iiwa_instance=iiwa,
         wsg_instance=wsg,
         q_wsg_instance=q_wsg_closed_plan,
-        min_clearance=0.011,
+        min_clearance=0.02,
         pair_range=0.8,
         extra_checked_model_instances=[brick_instance],
     )
@@ -392,7 +392,10 @@ def main():
     home_to_pregrasp_time_budget_s = 0.15 * max_planning_time_s
     grasp_primitive_time_budget_s = 0.20 * max_planning_time_s
     pregrasp_to_drop_time_budget_s = 0.60 * max_planning_time_s
-    shared_rrt_config = RRTConnectConfig()
+    shared_rrt_config = RRTConnectConfig(
+        final_validation_edge_resolution=0.01,
+        random_seed=0,
+    )
     fsm_options = ManipulationOptions(
         ik_soft_starts=ik_soft_starts,
         local_ik_soft_starts=2,
@@ -403,8 +406,9 @@ def main():
         grasp_primitive_time_budget_s=grasp_primitive_time_budget_s,
         pregrasp_to_drop_time_budget_s=pregrasp_to_drop_time_budget_s,
         rrt=shared_rrt_config,
-        drop_candidate_time_budget_s=8.0,
+        drop_candidate_time_budget_s=60.0,
         max_drop_candidates=20,
+        enable_drop_transport_bridges=False,
         grasp_options=grasp_options,
     )
     fsm = ManipulationFSM(
@@ -432,12 +436,22 @@ def main():
         for key in (
             "plan_home_to_pregrasp",
             "plan_grasp_primitive",
+            "plan_carry_escape",
+            "plan_drop_anchor_ik",
+            "plan_drop_preplace",
+            "plan_drop_rrt",
             "plan_pregrasp_to_drop",
             "drop_candidates_tried",
+            "drop_feasible_candidates",
+            "drop_rrt_calls",
             "plan_total",
         ):
             if key in fsm_result.timings_s:
-                if key == "drop_candidates_tried":
+                if key in {
+                    "drop_candidates_tried",
+                    "drop_feasible_candidates",
+                    "drop_rrt_calls",
+                }:
                     print(f"  {key}: {int(fsm_result.timings_s[key])}")
                 else:
                     print(f"  {key}: {fsm_result.timings_s[key]:.3f}")

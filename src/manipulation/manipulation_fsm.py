@@ -42,9 +42,10 @@ class ManipulationOptions:
     home_to_pregrasp_time_budget_s: float | None = None
     grasp_primitive_time_budget_s: float | None = None
     pregrasp_to_drop_time_budget_s: float | None = None
-    drop_candidate_time_budget_s: float | None = 8.0
+    drop_candidate_time_budget_s: float | None = 60.0
     max_drop_candidates: int | None = 20
     drop_rrt_candidate_batch_sizes: tuple[int, ...] = (1, 5, 20)
+    drop_rrt_seed_offsets: tuple[int, ...] = (2, 3, 4)
     enable_carry_escape: bool = True
     carry_escape_clearance_threshold_m: float | None = None
     carry_escape_try_home_staging: bool = True
@@ -55,7 +56,7 @@ class ManipulationOptions:
     drop_preplace_clearance_threshold_m: float | None = None
     drop_preplace_max_pullback_m: float = 0.20
     drop_preplace_open_clearance_margin_m: float | None = 0.02
-    enable_drop_transport_bridges: bool = True
+    enable_drop_transport_bridges: bool = False
     drop_transport_bridge_backoff_m: tuple[float, ...] = (0.25, 0.17, 0.09)
     drop_transport_bridge_low_z_offset_m: tuple[float, ...] = (-0.13, -0.03)
     drop_transport_bridge_high_z_offset_m: tuple[float, ...] = (0.07, 0.17)
@@ -315,10 +316,14 @@ class ManipulationFSM:
         is_free_fn: typing.Callable[[np.ndarray], bool] | None = None,
         search_is_free_fn: typing.Callable[[np.ndarray], bool] | None = None,
         planning_deadline_s: float | None = None,
+        random_seed: int | None = None,
         return_goal_index: bool = False,
         debug_label: str | None = None,
     ) -> list[np.ndarray] | tuple[list[np.ndarray], int]:
         is_free_fn = is_free_fn or self.is_free
+        plan_kwargs = self.options.rrt.to_plan_kwargs(deadline_s=planning_deadline_s)
+        if random_seed is not None:
+            plan_kwargs["random_seed"] = int(random_seed)
         try:
             result = rrt_connect_plan(
                 q_start=q_start,
@@ -327,7 +332,7 @@ class ManipulationFSM:
                 search_is_free=search_is_free_fn,
                 joints_lower_limits=self.joints_lower_limits,
                 joints_upper_limits=self.joints_upper_limits,
-                **self.options.rrt.to_plan_kwargs(deadline_s=planning_deadline_s),
+                **plan_kwargs,
                 return_goal_index=return_goal_index,
             )
         except Exception as exc:
@@ -400,22 +405,96 @@ class ManipulationFSM:
             return
         raise TimeoutError(f"{context} exceeded its planning deadline")
 
+    def _rrt_random_seed(self, offset: int = 0) -> int | None:
+        base_seed = self.options.rrt.random_seed
+        if base_seed is None:
+            return None
+        return int(base_seed) + int(offset)
+
+    def _ordered_drop_rrt_seed_offsets(self, batch_size: int) -> tuple[int, ...]:
+        seed_offsets = tuple(
+            int(seed_offset)
+            for seed_offset in self.options.drop_rrt_seed_offsets
+        ) or (0,)
+        preferred_seed_offset = 3 if int(batch_size) <= 5 else 2
+        if preferred_seed_offset not in seed_offsets:
+            return seed_offsets
+        return (preferred_seed_offset,) + tuple(
+            seed_offset
+            for seed_offset in seed_offsets
+            if seed_offset != preferred_seed_offset
+        )
+
     def _iter_drop_candidates(self, X_WG_drop: RigidTransform):
         p_WG_nominal = X_WG_drop.translation()
         R_WG_nominal = X_WG_drop.rotation()
 
+        def _is_zero(value: float) -> bool:
+            return abs(float(value)) <= 1e-12
+
+        nominal_xy_offsets = [
+            (float(dx), float(dy))
+            for dx, dy in self.options.drop_xy_offsets_m
+            if _is_zero(dx) and _is_zero(dy)
+        ]
+        non_nominal_xy_offsets = [
+            (float(dx), float(dy))
+            for dx, dy in self.options.drop_xy_offsets_m
+            if not (_is_zero(dx) and _is_zero(dy))
+        ]
+        nominal_z_offsets = [
+            float(dz)
+            for dz in self.options.drop_z_offsets_m
+            if _is_zero(dz)
+        ]
+        non_nominal_z_offsets = [
+            float(dz)
+            for dz in self.options.drop_z_offsets_m
+            if not _is_zero(dz)
+        ]
+        nominal_yaw_offsets = [
+            float(yaw)
+            for yaw in self.options.drop_yaw_offsets_rad
+            if _is_zero(yaw)
+        ]
+        non_nominal_yaw_offsets = [
+            float(yaw)
+            for yaw in self.options.drop_yaw_offsets_rad
+            if not _is_zero(yaw)
+        ]
+
+        ordered_translation_offsets: list[tuple[float, float, float]] = []
+        seen_translation_offsets: set[tuple[float, float, float]] = set()
+
+        def _append_translation_offsets(
+            xy_offsets: list[tuple[float, float]],
+            z_offsets: list[float],
+        ) -> None:
+            for dx, dy in xy_offsets:
+                for dz in z_offsets:
+                    offset = (float(dx), float(dy), float(dz))
+                    if offset in seen_translation_offsets:
+                        continue
+                    seen_translation_offsets.add(offset)
+                    ordered_translation_offsets.append(offset)
+
+        _append_translation_offsets(nominal_xy_offsets, nominal_z_offsets)
+        _append_translation_offsets(nominal_xy_offsets, non_nominal_z_offsets)
+        _append_translation_offsets(non_nominal_xy_offsets, nominal_z_offsets)
+        _append_translation_offsets(non_nominal_xy_offsets, non_nominal_z_offsets)
+
+        ordered_yaw_offsets = nominal_yaw_offsets + non_nominal_yaw_offsets
         candidate_index = 0
-        for dx, dy in self.options.drop_xy_offsets_m:
-            for dz in self.options.drop_z_offsets_m:
-                for yaw in self.options.drop_yaw_offsets_rad:
-                    if abs(float(yaw)) <= 1e-12:
-                        R_WG_candidate = R_WG_nominal
-                    else:
-                        R_WYaw = RollPitchYaw(0.0, 0.0, float(yaw)).ToRotationMatrix()
-                        R_WG_candidate = RotationMatrix(R_WYaw.matrix() @ R_WG_nominal.matrix())
-                    p_WG_candidate = p_WG_nominal + np.array([float(dx), float(dy), float(dz)])
-                    yield candidate_index, RigidTransform(R_WG_candidate, p_WG_candidate)
-                    candidate_index += 1
+        for yaw in ordered_yaw_offsets:
+            if abs(float(yaw)) <= 1e-12:
+                R_WG_candidate = R_WG_nominal
+            else:
+                R_WYaw = RollPitchYaw(0.0, 0.0, float(yaw)).ToRotationMatrix()
+                R_WG_candidate = RotationMatrix(R_WYaw.matrix() @ R_WG_nominal.matrix())
+            for dx, dy, dz in ordered_translation_offsets:
+                p_WG_candidate = p_WG_nominal + np.array([float(dx), float(dy), float(dz)])
+                yield candidate_index, RigidTransform(R_WG_candidate, p_WG_candidate)
+                candidate_index += 1
 
     def _strict_edge_resolution(self) -> float:
         resolution = self.options.rrt.final_validation_edge_resolution
@@ -610,11 +689,19 @@ class ManipulationFSM:
         if not bool(self.options.enable_carry_escape):
             carry_prefix = [q_postgrasp_retreat.copy()]
         else:
+            # If home staging is enabled and feasible, keep pulling back until the
+            # carried state can actually connect to home instead of stopping on a
+            # merely local clearance threshold.
+            absolute_clearance_threshold_m = self.options.carry_escape_clearance_threshold_m
+            open_clearance_margin_m = self.options.carry_escape_open_clearance_margin_m
+            if bool(self.options.carry_escape_try_home_staging) and home_is_carry_feasible:
+                absolute_clearance_threshold_m = None
+                open_clearance_margin_m = None
             axial_result = self._plan_axial_clearance_path(
                 q_anchor=q_postgrasp_retreat,
                 is_free_fn=self.is_free_carry,
-                absolute_clearance_threshold_m=self.options.carry_escape_clearance_threshold_m,
-                open_clearance_margin_m=self.options.carry_escape_open_clearance_margin_m,
+                absolute_clearance_threshold_m=absolute_clearance_threshold_m,
+                open_clearance_margin_m=open_clearance_margin_m,
                 max_pullback_m=self.options.carry_escape_max_pullback_m,
                 step_m=self.options.axial_pullback_step_m,
                 planning_deadline_s=planning_deadline_s,
@@ -1012,6 +1099,7 @@ class ManipulationFSM:
                 q_pregrasp,
                 search_is_free_fn=self.is_free,
                 planning_deadline_s=home_deadline_s,
+                random_seed=self._rrt_random_seed(1),
                 debug_label="home_to_pregrasp",
             )
             timings_s["plan_home_to_pregrasp"] = time.perf_counter() - phase_start
@@ -1080,10 +1168,14 @@ class ManipulationFSM:
             X_WG_drop_selected = None
             drop_failures = []
             drop_candidates_tried = 0
+            drop_feasible_candidates = 0
+            drop_anchor_ik_time_s = 0.0
+            drop_preplace_time_s = 0.0
+            drop_rrt_time_s = 0.0
+            drop_rrt_calls = 0
             feasible_drop_candidates: list[
                 tuple[int, RigidTransform, np.ndarray, np.ndarray, list[np.ndarray]]
             ] = []
-            shared_drop_transport_bridges: DropTransportSharedBridges | None = None
             drop_rrt_batch_sizes = tuple(
                 max(1, int(batch_size))
                 for batch_size in self.options.drop_rrt_candidate_batch_sizes
@@ -1108,6 +1200,8 @@ class ManipulationFSM:
                 nonlocal path_pregrasp_to_drop
                 nonlocal drop_candidate_index
                 nonlocal X_WG_drop_selected
+                nonlocal drop_rrt_time_s
+                nonlocal drop_rrt_calls
 
                 if not feasible_drop_candidates:
                     return False
@@ -1122,45 +1216,59 @@ class ManipulationFSM:
                     ):
                         return False
 
-                    candidate_deadline_s = _resolve_drop_candidate_deadline()
-                    try:
-                        q_drop_candidates = [
-                            candidate[3] for candidate in feasible_drop_candidates[:batch_size]
-                        ]
-                        path_candidate, selected_goal_slot = self._plan_rrt(
-                            q_drop_rrt_start,
-                            q_drop_candidates,
-                            is_free_fn=self.is_free_carry,
-                            planning_deadline_s=candidate_deadline_s,
-                            return_goal_index=True,
-                            debug_label=f"drop_candidates_multi_goal_batch_{batch_size}",
-                        )
-                    except TimeoutError:
-                        drop_failures.append(
-                            f"drop_candidates_multi_goal_batch_{batch_size}: RRT timeout"
-                        )
-                    except Exception as exc:
-                        drop_failures.append(
-                            f"drop_candidates_multi_goal_batch_{batch_size}: {exc}"
-                        )
-                    else:
-                        (
-                            selected_candidate_index,
-                            selected_drop_pose,
-                            selected_q_drop,
-                            _selected_transit_goal,
-                            selected_insertion_path,
-                        ) = feasible_drop_candidates[int(selected_goal_slot)]
-                        q_drop = np.asarray(selected_q_drop, dtype=float).copy()
-                        path_pregrasp_to_drop = self._merge_joint_paths(
-                            path_carry_escape,
-                            path_candidate,
-                            selected_insertion_path,
-                        )
-                        drop_candidate_index = int(selected_candidate_index)
-                        X_WG_drop_selected = selected_drop_pose
-                        next_drop_rrt_batch_index += 1
-                        return True
+                    q_drop_candidates = [
+                        candidate[3] for candidate in feasible_drop_candidates[:batch_size]
+                    ]
+                    seed_offsets = self._ordered_drop_rrt_seed_offsets(batch_size)
+                    for retry_index, seed_offset in enumerate(seed_offsets):
+                        candidate_deadline_s = _resolve_drop_candidate_deadline()
+                        rrt_batch_seed = self._rrt_random_seed(seed_offset)
+                        rrt_batch_start = time.perf_counter()
+                        drop_rrt_calls += 1
+                        try:
+                            path_candidate, selected_goal_slot = self._plan_rrt(
+                                q_drop_rrt_start,
+                                q_drop_candidates,
+                                is_free_fn=self.is_free_carry,
+                                search_is_free_fn=self.is_free_carry,
+                                planning_deadline_s=candidate_deadline_s,
+                                random_seed=rrt_batch_seed,
+                                return_goal_index=True,
+                                debug_label=(
+                                    "drop_candidates_multi_goal_batch_"
+                                    f"{batch_size}_retry_{retry_index}"
+                                ),
+                            )
+                        except TimeoutError as exc:
+                            drop_failures.append(
+                                "drop_candidates_multi_goal_batch_"
+                                f"{batch_size}_retry_{retry_index}: {exc}"
+                            )
+                        except Exception as exc:
+                            drop_failures.append(
+                                "drop_candidates_multi_goal_batch_"
+                                f"{batch_size}_retry_{retry_index}: {exc}"
+                            )
+                        else:
+                            (
+                                selected_candidate_index,
+                                selected_drop_pose,
+                                selected_q_drop,
+                                _selected_transit_goal,
+                                selected_insertion_path,
+                            ) = feasible_drop_candidates[int(selected_goal_slot)]
+                            q_drop = np.asarray(selected_q_drop, dtype=float).copy()
+                            path_pregrasp_to_drop = self._merge_joint_paths(
+                                path_carry_escape,
+                                path_candidate,
+                                selected_insertion_path,
+                            )
+                            drop_candidate_index = int(selected_candidate_index)
+                            X_WG_drop_selected = selected_drop_pose
+                            next_drop_rrt_batch_index += 1
+                            return True
+                        finally:
+                            drop_rrt_time_s += time.perf_counter() - rrt_batch_start
 
                     next_drop_rrt_batch_index += 1
                     if not force:
@@ -1182,31 +1290,39 @@ class ManipulationFSM:
                     break
                 drop_candidates_tried += 1
                 try:
-                    q_drop_candidate = solve_iiwa_ik_for_gripper_pose(
-                        plant=self.plant,
-                        root_context_current=self.root_context_current,
-                        iiwa_instance=self.iiwa_instance,
-                        wsg_instance=self.wsg_instance,
-                        desired_end_effector=X_WG_drop_candidate,
-                        q_iiwa_seed=grasp_plan.q_postgrasp_retreat,
-                        position_tol=self.options.position_tol,
-                        theta_tol=self.options.theta_tol,
-                        max_soft_starts=self.options.ik_soft_starts,
-                        soft_start_sigma=self.options.ik_soft_start_sigma,
-                        soft_start_random_seed=self.options.ik_soft_start_seed + 100 + candidate_index,
-                        deadline_s=drop_deadline_s,
-                    )
+                    anchor_ik_start = time.perf_counter()
+                    try:
+                        q_drop_candidate = solve_iiwa_ik_for_gripper_pose(
+                            plant=self.plant,
+                            root_context_current=self.root_context_current,
+                            iiwa_instance=self.iiwa_instance,
+                            wsg_instance=self.wsg_instance,
+                            desired_end_effector=X_WG_drop_candidate,
+                            q_iiwa_seed=grasp_plan.q_postgrasp_retreat,
+                            position_tol=self.options.position_tol,
+                            theta_tol=self.options.theta_tol,
+                            max_soft_starts=self.options.ik_soft_starts,
+                            soft_start_sigma=self.options.ik_soft_start_sigma,
+                            soft_start_random_seed=self.options.ik_soft_start_seed + 100 + candidate_index,
+                            deadline_s=drop_deadline_s,
+                        )
+                    finally:
+                        drop_anchor_ik_time_s += time.perf_counter() - anchor_ik_start
                     if not self.is_free_carry(q_drop_candidate):
                         drop_failures.append(
                             f"drop_candidate_{candidate_index}: IK solution not collision free for carry state"
                         )
                         continue
-                    q_drop_transit_goal, insertion_path = self._find_drop_transit_goal(
-                        candidate_index=candidate_index,
-                        X_WG_drop_candidate=X_WG_drop_candidate,
-                        q_drop_candidate=q_drop_candidate,
-                        planning_deadline_s=drop_deadline_s,
-                    )
+                    preplace_start = time.perf_counter()
+                    try:
+                        q_drop_transit_goal, insertion_path = self._find_drop_transit_goal(
+                            candidate_index=candidate_index,
+                            X_WG_drop_candidate=X_WG_drop_candidate,
+                            q_drop_candidate=q_drop_candidate,
+                            planning_deadline_s=drop_deadline_s,
+                        )
+                    finally:
+                        drop_preplace_time_s += time.perf_counter() - preplace_start
                     candidate = (
                         candidate_index,
                         X_WG_drop_candidate,
@@ -1215,28 +1331,9 @@ class ManipulationFSM:
                         [np.asarray(q, dtype=float).copy() for q in insertion_path],
                     )
                     feasible_drop_candidates.append(candidate)
-                    if bool(self.options.enable_drop_transport_bridges):
-                        if shared_drop_transport_bridges is None:
-                            shared_drop_transport_bridges = self._compute_shared_drop_transport_bridges(
-                                q_transit_start=q_drop_rrt_start,
-                                X_WG_drop_reference=X_WG_drop,
-                                planning_deadline_s=drop_deadline_s,
-                            )
-                        deterministic_drop = self._try_deterministic_drop_transport(
-                            q_transit_start=q_drop_rrt_start,
-                            path_carry_escape=path_carry_escape,
-                            candidate=candidate,
-                            shared_bridges=shared_drop_transport_bridges,
-                            planning_deadline_s=drop_deadline_s,
-                        )
-                        if deterministic_drop is not None:
-                            (
-                                q_drop,
-                                path_pregrasp_to_drop,
-                                drop_candidate_index,
-                                X_WG_drop_selected,
-                            ) = deterministic_drop
-                            break
+                    drop_feasible_candidates += 1
+                    # Professional transport stack:
+                    # carry escape -> seeded RRT to pre-place -> deterministic insertion.
                     if _attempt_drop_rrt(force=False):
                         break
                 except TimeoutError:
@@ -1247,8 +1344,13 @@ class ManipulationFSM:
             if q_drop is None and feasible_drop_candidates:
                 _attempt_drop_rrt(force=True)
 
+            timings_s["plan_drop_anchor_ik"] = drop_anchor_ik_time_s
+            timings_s["plan_drop_preplace"] = drop_preplace_time_s
+            timings_s["plan_drop_rrt"] = drop_rrt_time_s
             timings_s["plan_pregrasp_to_drop"] = time.perf_counter() - phase_start
             timings_s["drop_candidates_tried"] = float(drop_candidates_tried)
+            timings_s["drop_feasible_candidates"] = float(drop_feasible_candidates)
+            timings_s["drop_rrt_calls"] = float(drop_rrt_calls)
             if q_drop is None or path_pregrasp_to_drop is None or X_WG_drop_selected is None:
                 details = "; ".join(drop_failures)
                 raise RuntimeError(f"Drop planning failed. {details}")
