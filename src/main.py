@@ -340,8 +340,25 @@ def main():
         iiwa_instance=iiwa,
         wsg_instance=wsg,
         q_wsg_instance=q_wsg_closed_plan,
-        min_clearance=0.02,
-        pair_range=0.8,
+        min_clearance=0.017,
+        pair_range=0.07,
+        extra_checked_model_instances=[brick_instance],
+    )
+    # Clearance-estimation checker for deterministic pre-drop pullback.
+    # This is intentionally decoupled from the transport RRT carry threshold:
+    # the pullback should stop when the carried brick is meaningfully clear of
+    # nearby clutter, not merely when it satisfies the minimum transport margin.
+    drop_preplace_clearance_target_m = 0.20
+    drop_preplace_clearance_pair_range_m = 0.30
+    is_free_drop_preplace_clearance = is_collision_free(
+        plant=sim_plant,
+        scene_graph=scene_graph,
+        root_context=root_context,
+        iiwa_instance=iiwa,
+        wsg_instance=wsg,
+        q_wsg_instance=q_wsg_closed_plan,
+        min_clearance=0.0,
+        pair_range=drop_preplace_clearance_pair_range_m,
         extra_checked_model_instances=[brick_instance],
     )
 
@@ -363,7 +380,7 @@ def main():
     print("\n[Pregrasp] X_WG_pregrasp =", X_WG_pregrasp)
 
     # Drop target for place/release.
-    drop_position_W = np.array([0.1, 0.09, 0.58])
+    drop_position_W = np.array([-0.08, 0.02, 0.040])
     X_WG_drop = RigidTransform(X_WG_pregrasp.rotation(), drop_position_W)
 
     joints_lower_limits, joints_upper_limits = _compute_iiwa_joint_limits(sim_plant, iiwa)
@@ -394,7 +411,7 @@ def main():
     pregrasp_to_drop_time_budget_s = 0.60 * max_planning_time_s
     shared_rrt_config = RRTConnectConfig(
         final_validation_edge_resolution=0.01,
-        random_seed=0,
+        random_seed=None,
     )
     fsm_options = ManipulationOptions(
         ik_soft_starts=ik_soft_starts,
@@ -407,6 +424,7 @@ def main():
         pregrasp_to_drop_time_budget_s=pregrasp_to_drop_time_budget_s,
         rrt=shared_rrt_config,
         drop_candidate_time_budget_s=60.0,
+        drop_preplace_clearance_threshold_m=drop_preplace_clearance_target_m,
         max_drop_candidates=20,
         enable_drop_transport_bridges=False,
         grasp_options=grasp_options,
@@ -422,6 +440,7 @@ def main():
         is_free_grasp=is_free_grasp,
         is_free_deapproach=is_free_deapproach,
         is_free_carry=is_free_carry,
+        drop_preplace_clearance_source=is_free_drop_preplace_clearance,
         q_wsg_carry=q_wsg_closed_plan,
         carry_payload_instance=brick_instance,
         options=fsm_options,
@@ -457,7 +476,11 @@ def main():
                     print(f"  {key}: {fsm_result.timings_s[key]:.3f}")
     if not fsm_result.success or fsm_result.plan is None:
         print("FSM transitions:", [s.value for s in fsm_result.transition_history])
-        raise RuntimeError(f"Manipulation FSM failed: {fsm_result.error_message}")
+        if fsm_result.error_message:
+            print(fsm_result.error_message)
+        else:
+            print("Manipulation FSM failed.")
+        return 1
 
     plan = fsm_result.plan
     print("FSM transitions:", [s.value for s in fsm_result.transition_history])
@@ -593,4 +616,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

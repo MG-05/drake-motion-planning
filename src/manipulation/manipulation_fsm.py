@@ -229,6 +229,7 @@ class ManipulationFSM:
         is_free_grasp: typing.Callable[[np.ndarray], bool] | None = None,
         is_free_deapproach: typing.Callable[[np.ndarray], bool] | None = None,
         is_free_carry: typing.Callable[[np.ndarray], bool] | None = None,
+        drop_preplace_clearance_source: typing.Callable[[np.ndarray], bool] | None = None,
         q_wsg_carry: np.ndarray | None = None,
         carry_payload_instance=None,
         carry_payload_carrier_frame_name: str = "body",
@@ -242,6 +243,9 @@ class ManipulationFSM:
         self.is_free_grasp = is_free_grasp or is_free
         self.is_free_carry = is_free_carry or self.is_free_grasp
         self.is_free_deapproach = is_free_deapproach or self.is_free_carry
+        self.drop_preplace_clearance_source = (
+            drop_preplace_clearance_source or self.is_free_carry
+        )
         self.q_wsg_carry = None if q_wsg_carry is None else np.asarray(q_wsg_carry, dtype=float).copy()
         self.carry_payload_instance = carry_payload_instance
         self.carry_payload_carrier_frame_name = str(carry_payload_carrier_frame_name)
@@ -259,7 +263,11 @@ class ManipulationFSM:
 
         configure_fns: list[typing.Callable[..., None]] = []
         seen = set()
-        for checker in (self.is_free_deapproach, self.is_free_carry):
+        for checker in (
+            self.is_free_deapproach,
+            self.is_free_carry,
+            self.drop_preplace_clearance_source,
+        ):
             if checker is None:
                 continue
             checker_id = id(checker)
@@ -308,6 +316,58 @@ class ManipulationFSM:
                 carrier_frame=carrier_frame,
                 X_CB=X_CB,
             )
+
+    def _solve_anchor_pose_ik(
+        self,
+        X_WG_target: RigidTransform,
+        q_seed: np.ndarray,
+        planning_deadline_s: float | None = None,
+        *,
+        soft_start_seed_offset: int = 0,
+    ) -> np.ndarray:
+        return solve_iiwa_ik_for_gripper_pose(
+            plant=self.plant,
+            root_context_current=self.root_context_current,
+            iiwa_instance=self.iiwa_instance,
+            wsg_instance=self.wsg_instance,
+            desired_end_effector=X_WG_target,
+            q_iiwa_seed=q_seed,
+            position_tol=self.options.position_tol,
+            theta_tol=self.options.theta_tol,
+            max_soft_starts=self.options.ik_soft_starts,
+            soft_start_sigma=self.options.ik_soft_start_sigma,
+            soft_start_random_seed=self.options.ik_soft_start_seed + int(soft_start_seed_offset),
+            deadline_s=planning_deadline_s,
+        )
+
+    @staticmethod
+    def _format_pose_translation(X_WG_target: RigidTransform) -> str:
+        p = np.asarray(X_WG_target.translation(), dtype=float).reshape(3)
+        return "[" + ", ".join(f"{coord:.3f}" for coord in p) + "]"
+
+    def _require_pose_reachable(
+        self,
+        *,
+        pose_label: str,
+        X_WG_target: RigidTransform,
+        q_seed: np.ndarray,
+        planning_deadline_s: float | None = None,
+        soft_start_seed_offset: int = 0,
+    ) -> np.ndarray:
+        try:
+            return self._solve_anchor_pose_ik(
+                X_WG_target=X_WG_target,
+                q_seed=q_seed,
+                planning_deadline_s=planning_deadline_s,
+                soft_start_seed_offset=soft_start_seed_offset,
+            )
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"{pose_label} location is not in reach "
+                f"(target position {self._format_pose_translation(X_WG_target)})."
+            ) from exc
 
     def _plan_rrt(
         self,
@@ -567,6 +627,7 @@ class ManipulationFSM:
         q_anchor: np.ndarray,
         is_free_fn: typing.Callable[[np.ndarray], bool],
         *,
+        clearance_source_fn: typing.Callable[[np.ndarray], bool] | None = None,
         absolute_clearance_threshold_m: float | None,
         open_clearance_margin_m: float | None,
         max_pullback_m: float,
@@ -580,12 +641,13 @@ class ManipulationFSM:
             q_anchor,
             q_wsg_instance=self.q_wsg_carry,
         )
+        clearance_source_fn = clearance_source_fn or is_free_fn
         R_anchor = X_anchor.rotation()
         p_anchor = np.asarray(X_anchor.translation(), dtype=float).reshape(3)
         approach_axis_W = R_anchor.matrix()[:, 1]
-        estimate_clearance_fn = getattr(is_free_fn, "estimate_clearance", None)
+        estimate_clearance_fn = getattr(clearance_source_fn, "estimate_clearance", None)
         target_clearance_m = self._resolve_open_clearance_target(
-            is_free_fn,
+            clearance_source_fn,
             absolute_clearance_threshold_m,
             open_clearance_margin_m,
         )
@@ -700,6 +762,7 @@ class ManipulationFSM:
             axial_result = self._plan_axial_clearance_path(
                 q_anchor=q_postgrasp_retreat,
                 is_free_fn=self.is_free_carry,
+                clearance_source_fn=self.is_free_carry,
                 absolute_clearance_threshold_m=absolute_clearance_threshold_m,
                 open_clearance_margin_m=open_clearance_margin_m,
                 max_pullback_m=self.options.carry_escape_max_pullback_m,
@@ -730,6 +793,7 @@ class ManipulationFSM:
         axial_result = self._plan_axial_clearance_path(
             q_anchor=q_drop_candidate,
             is_free_fn=self.is_free_carry,
+            clearance_source_fn=self.drop_preplace_clearance_source,
             absolute_clearance_threshold_m=self.options.drop_preplace_clearance_threshold_m,
             open_clearance_margin_m=self.options.drop_preplace_open_clearance_margin_m,
             max_pullback_m=self.options.drop_preplace_max_pullback_m,
@@ -1078,19 +1142,12 @@ class ManipulationFSM:
                 stage_deadline_s=home_deadline_s,
                 stage_budget_s=self.options.home_to_pregrasp_time_budget_s,
             )
-            q_pregrasp = solve_iiwa_ik_for_gripper_pose(
-                plant=self.plant,
-                root_context_current=self.root_context_current,
-                iiwa_instance=self.iiwa_instance,
-                wsg_instance=self.wsg_instance,
-                desired_end_effector=X_WG_pregrasp,
-                q_iiwa_seed=q_home,
-                position_tol=self.options.position_tol,
-                theta_tol=self.options.theta_tol,
-                max_soft_starts=self.options.ik_soft_starts,
-                soft_start_sigma=self.options.ik_soft_start_sigma,
-                soft_start_random_seed=self.options.ik_soft_start_seed,
-                deadline_s=home_deadline_s,
+            q_pregrasp = self._require_pose_reachable(
+                pose_label="Pickup",
+                X_WG_target=X_WG_pregrasp,
+                q_seed=q_home,
+                planning_deadline_s=home_deadline_s,
+                soft_start_seed_offset=0,
             )
             if not self.is_free(q_pregrasp):
                 raise RuntimeError("Pregrasp IK solution is not collision free")
@@ -1154,6 +1211,13 @@ class ManipulationFSM:
                 planning_deadline_s=planning_deadline_s,
                 stage_deadline_s=drop_deadline_s,
                 stage_budget_s=self.options.pregrasp_to_drop_time_budget_s,
+            )
+            self._require_pose_reachable(
+                pose_label="Drop",
+                X_WG_target=X_WG_drop,
+                q_seed=grasp_plan.q_postgrasp_retreat,
+                planning_deadline_s=drop_deadline_s,
+                soft_start_seed_offset=100,
             )
             carry_escape_start = time.perf_counter()
             path_carry_escape, q_drop_rrt_start = self._plan_carry_escape_prefix(
