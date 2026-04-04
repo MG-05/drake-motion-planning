@@ -166,7 +166,7 @@ def test_rrt_multi_goal_returns_selected_goal_index():
     assert np.allclose(path[-1], np.array([0.0, 1.0]))
 
 
-def test_postprocess_rrt_path_shortcuts_with_budgeted_random_attempts():
+def test_postprocess_rrt_path_shortcuts_with_exhaustive_waypoint_pairs():
     def strict_is_free(q):
         return True
 
@@ -184,8 +184,8 @@ def test_postprocess_rrt_path_shortcuts_with_budgeted_random_attempts():
     config = RRTConnectConfig(
         enable_shortcut=True,
         shortcut_edge_resolution=0.20,
-        shortcut_max_attempts=8,
-        shortcut_time_budget_s=1.0,
+        shortcut_max_passes=None,
+        shortcut_time_budget_s=None,
         final_validation_edge_resolution=0.05,
         random_seed=0,
         adaptive_step_config=None,
@@ -220,8 +220,8 @@ def test_postprocess_rrt_path_falls_back_to_raw_path_when_shortcut_fails_strict_
     config = RRTConnectConfig(
         enable_shortcut=True,
         shortcut_edge_resolution=0.20,
-        shortcut_max_attempts=8,
-        shortcut_time_budget_s=1.0,
+        shortcut_max_passes=None,
+        shortcut_time_budget_s=None,
         final_validation_edge_resolution=0.05,
         random_seed=0,
         adaptive_step_config=None,
@@ -336,7 +336,7 @@ if __name__ == "__main__":
     test_failure_shrinks_immediately_and_sets_clearance_cap()
     test_rrt_direct_connect_returns_two_point_path()
     test_rrt_multi_goal_returns_selected_goal_index()
-    test_postprocess_rrt_path_shortcuts_with_budgeted_random_attempts()
+    test_postprocess_rrt_path_shortcuts_with_exhaustive_waypoint_pairs()
     test_postprocess_rrt_path_falls_back_to_raw_path_when_shortcut_fails_strict_validation()
     test_rrt_failure_message_includes_telemetry()
     test_rrt_timeout_message_includes_telemetry()

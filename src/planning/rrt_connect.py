@@ -62,8 +62,8 @@ class RRTConnectConfig:
     max_connect_steps: int = 250
     enable_shortcut: bool = True
     shortcut_edge_resolution: float | None = None
-    shortcut_max_attempts: int | None = 128
-    shortcut_time_budget_s: float | None = 1.0
+    shortcut_max_passes: int | None = None
+    shortcut_time_budget_s: float | None = None
     final_validation_edge_resolution: float | None = 0.03
     random_seed: int | None = 0
     adaptive_step_config: AdaptiveStepConfig = dc.field(
@@ -241,46 +241,58 @@ def _joint_path_length(path) -> float:
     return float(sum(np.linalg.norm(path[i + 1] - path[i]) for i in range(len(path) - 1)))
 
 
-def randomized_shortcut_path(
+def shortcut_path(
     path,
     is_free,
     *,
     edge_resolution=0.01,
-    max_attempts: int | None = None,
-    random_seed: int | None = None,
+    max_passes: int | None = None,
     deadline_s: float | None = None,
 ):
     """
-    Randomized shortcutting over waypoint indices with a hard attempt budget.
+    Exhaustive waypoint-pair shortcutting over the current path.
 
-    This is intentionally a cheap proposal stage. Callers are expected to run
-    one strict final validation pass before accepting the shortened result.
+    Each pass checks larger waypoint gaps first, removing the first valid
+    shortcut it finds before restarting. This restores the earlier O(n^2)-style
+    smoothing behavior while still respecting any caller-provided deadline.
     """
 
     path = _copy_joint_path(path)
     if len(path) <= 2:
         return path
 
-    rng = np.random.default_rng(random_seed)
-    attempts = 0
-    while len(path) > 2:
+    passes = 0
+    while True:
         if deadline_s is not None and time.perf_counter() > float(deadline_s):
             raise TimeoutError("RRT-Connect timed out before finding a path.")
-        if max_attempts is not None and attempts >= int(max_attempts):
+        if max_passes is not None and passes >= int(max_passes):
             break
 
-        attempts += 1
+        improved = False
         n = len(path)
-        i = int(rng.integers(0, n - 2))
-        j = int(rng.integers(i + 2, n))
-        if edge_is_free(
-            is_free,
-            path[i],
-            path[j],
-            resolution=edge_resolution,
-            deadline_s=deadline_s,
-        ):
-            path = path[: i + 1] + path[j:]
+
+        # Try larger index gaps first to remove as many intermediate nodes as possible.
+        for gap in range(n - 1, 1, -1):
+            for i in range(0, n - gap):
+                if deadline_s is not None and time.perf_counter() > float(deadline_s):
+                    raise TimeoutError("RRT-Connect timed out before finding a path.")
+                j = i + gap
+                if edge_is_free(
+                    is_free,
+                    path[i],
+                    path[j],
+                    resolution=edge_resolution,
+                    deadline_s=deadline_s,
+                ):
+                    path = path[: i + 1] + path[j:]
+                    improved = True
+                    break
+            if improved:
+                break
+
+        passes += 1
+        if not improved:
+            break
 
     return path
 
@@ -332,12 +344,11 @@ def postprocess_rrt_path(
     )
 
     try:
-        candidate_path = randomized_shortcut_path(
+        candidate_path = shortcut_path(
             raw_path,
             proposal_checker,
             edge_resolution=shortcut_resolution,
-            max_attempts=planner_config.shortcut_max_attempts,
-            random_seed=planner_config.random_seed,
+            max_passes=planner_config.shortcut_max_passes,
             deadline_s=shortcut_deadline_s,
         )
     except TimeoutError:
