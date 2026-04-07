@@ -380,7 +380,7 @@ def main():
     print("\n[Pregrasp] X_WG_pregrasp =", X_WG_pregrasp)
 
     # Drop target for place/release.
-    drop_position_W = np.array([0.0, 0.17, 0.58])
+    drop_position_W = np.array([0.0, 0.05, 0.78])
     X_WG_drop = RigidTransform(X_WG_pregrasp.rotation(), drop_position_W)
 
     joints_lower_limits, joints_upper_limits = _compute_iiwa_joint_limits(sim_plant, iiwa)
