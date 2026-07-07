@@ -206,3 +206,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# macOS
+.DS_Store
+
+# Claude Code local state
+.claude/
+
+# MeshCat static-HTML recordings written by src/main.py (tens of MB each)
+rrt_connect.html
+src/rrt_connect.html

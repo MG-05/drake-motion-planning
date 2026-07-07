@@ -1,0 +1,826 @@
+{
+  "levels": [
+    "low",
+    "mid",
+    "high"
+  ],
+  "single_query": [
+    {
+      "level": "low",
+      "planner": "rrt",
+      "seed": 0,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.1537115419996553,
+      "path_length_rad": 3.8042223897467013,
+      "waypoints": 40
+    },
+    {
+      "level": "low",
+      "planner": "rrt",
+      "seed": 1,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.4563750000015716,
+      "path_length_rad": 3.9044499100044976,
+      "waypoints": 41
+    },
+    {
+      "level": "low",
+      "planner": "rrt",
+      "seed": 2,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.09942516700539272,
+      "path_length_rad": 3.9470705637159966,
+      "waypoints": 41
+    },
+    {
+      "level": "low",
+      "planner": "rrt",
+      "seed": 3,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.12029779200383928,
+      "path_length_rad": 4.031011599726942,
+      "waypoints": 42
+    },
+    {
+      "level": "low",
+      "planner": "rrt",
+      "seed": 4,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.12528025000210619,
+      "path_length_rad": 3.8567193878064083,
+      "waypoints": 40
+    },
+    {
+      "level": "low",
+      "planner": "rrt_connect_fixed",
+      "seed": 0,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.017815416998928413,
+      "path_length_rad": 2.987582084950561,
+      "waypoints": 2
+    },
+    {
+      "level": "low",
+      "planner": "rrt_connect_fixed",
+      "seed": 1,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.018118959000275936,
+      "path_length_rad": 2.987582084950561,
+      "waypoints": 2
+    },
+    {
+      "level": "low",
+      "planner": "rrt_connect_fixed",
+      "seed": 2,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.0179715420017601,
+      "path_length_rad": 2.987582084950561,
+      "waypoints": 2
+    },
+    {
+      "level": "low",
+      "planner": "rrt_connect_fixed",
+      "seed": 3,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.017786959004297387,
+      "path_length_rad": 2.987582084950561,
+      "waypoints": 2
+    },
+    {
+      "level": "low",
+      "planner": "rrt_connect_fixed",
+      "seed": 4,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.017946500003745314,
+      "path_length_rad": 2.987582084950561,
+      "waypoints": 2
+    },
+    {
+      "level": "low",
+      "planner": "rrt_connect_adaptive",
+      "seed": 0,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.017837334002251737,
+      "path_length_rad": 2.987582084950561,
+      "waypoints": 2
+    },
+    {
+      "level": "low",
+      "planner": "rrt_connect_adaptive",
+      "seed": 1,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.01773408400185872,
+      "path_length_rad": 2.987582084950561,
+      "waypoints": 2
+    },
+    {
+      "level": "low",
+      "planner": "rrt_connect_adaptive",
+      "seed": 2,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.018056041000818368,
+      "path_length_rad": 2.987582084950561,
+      "waypoints": 2
+    },
+    {
+      "level": "low",
+      "planner": "rrt_connect_adaptive",
+      "seed": 3,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.017881209001643583,
+      "path_length_rad": 2.987582084950561,
+      "waypoints": 2
+    },
+    {
+      "level": "low",
+      "planner": "rrt_connect_adaptive",
+      "seed": 4,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.018020083000010345,
+      "path_length_rad": 2.987582084950561,
+      "waypoints": 2
+    },
+    {
+      "level": "mid",
+      "planner": "rrt",
+      "seed": 0,
+      "timeout_s": 30.0,
+      "success": false,
+      "time_s": 30.0,
+      "reason": "timeout"
+    },
+    {
+      "level": "mid",
+      "planner": "rrt",
+      "seed": 1,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.11208787500072503,
+      "path_length_rad": 4.525635879318512,
+      "waypoints": 47
+    },
+    {
+      "level": "mid",
+      "planner": "rrt",
+      "seed": 2,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.1493397919985,
+      "path_length_rad": 4.414959553807503,
+      "waypoints": 46
+    },
+    {
+      "level": "mid",
+      "planner": "rrt",
+      "seed": 3,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.12318241700268118,
+      "path_length_rad": 4.225528114670593,
+      "waypoints": 44
+    },
+    {
+      "level": "mid",
+      "planner": "rrt",
+      "seed": 4,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.14967049999540905,
+      "path_length_rad": 4.503211288174635,
+      "waypoints": 47
+    },
+    {
+      "level": "mid",
+      "planner": "rrt_connect_fixed",
+      "seed": 0,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.044507625003461726,
+      "path_length_rad": 3.5141008093498156,
+      "waypoints": 3
+    },
+    {
+      "level": "mid",
+      "planner": "rrt_connect_fixed",
+      "seed": 1,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.13103358299849788,
+      "path_length_rad": 3.858011716287887,
+      "waypoints": 3
+    },
+    {
+      "level": "mid",
+      "planner": "rrt_connect_fixed",
+      "seed": 2,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.04544245900615351,
+      "path_length_rad": 3.5002862076663828,
+      "waypoints": 3
+    },
+    {
+      "level": "mid",
+      "planner": "rrt_connect_fixed",
+      "seed": 3,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.040707415995711926,
+      "path_length_rad": 3.499053923075506,
+      "waypoints": 3
+    },
+    {
+      "level": "mid",
+      "planner": "rrt_connect_fixed",
+      "seed": 4,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.0408481250051409,
+      "path_length_rad": 3.5419440870493046,
+      "waypoints": 3
+    },
+    {
+      "level": "mid",
+      "planner": "rrt_connect_adaptive",
+      "seed": 0,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.04495958299958147,
+      "path_length_rad": 3.499602668729599,
+      "waypoints": 3
+    },
+    {
+      "level": "mid",
+      "planner": "rrt_connect_adaptive",
+      "seed": 1,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.07901425000454765,
+      "path_length_rad": 4.4323946451934555,
+      "waypoints": 3
+    },
+    {
+      "level": "mid",
+      "planner": "rrt_connect_adaptive",
+      "seed": 2,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.08134137500019278,
+      "path_length_rad": 3.8624477703754705,
+      "waypoints": 13
+    },
+    {
+      "level": "mid",
+      "planner": "rrt_connect_adaptive",
+      "seed": 3,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.051918042001489084,
+      "path_length_rad": 3.6902017364286417,
+      "waypoints": 3
+    },
+    {
+      "level": "mid",
+      "planner": "rrt_connect_adaptive",
+      "seed": 4,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.0966913750016829,
+      "path_length_rad": 4.4230728855252455,
+      "waypoints": 3
+    },
+    {
+      "level": "high",
+      "planner": "rrt",
+      "seed": 0,
+      "timeout_s": 30.0,
+      "success": false,
+      "time_s": 30.0,
+      "reason": "timeout"
+    },
+    {
+      "level": "high",
+      "planner": "rrt",
+      "seed": 1,
+      "timeout_s": 30.0,
+      "success": false,
+      "time_s": 30.0,
+      "reason": "timeout"
+    },
+    {
+      "level": "high",
+      "planner": "rrt",
+      "seed": 2,
+      "timeout_s": 30.0,
+      "success": false,
+      "time_s": 30.0,
+      "reason": "timeout"
+    },
+    {
+      "level": "high",
+      "planner": "rrt",
+      "seed": 3,
+      "timeout_s": 30.0,
+      "success": false,
+      "time_s": 30.0,
+      "reason": "timeout"
+    },
+    {
+      "level": "high",
+      "planner": "rrt",
+      "seed": 4,
+      "timeout_s": 30.0,
+      "success": false,
+      "time_s": 30.0,
+      "reason": "timeout"
+    },
+    {
+      "level": "high",
+      "planner": "rrt_connect_fixed",
+      "seed": 0,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.05849787500483217,
+      "path_length_rad": 4.268760027962558,
+      "waypoints": 3
+    },
+    {
+      "level": "high",
+      "planner": "rrt_connect_fixed",
+      "seed": 1,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.037116457999218255,
+      "path_length_rad": 3.295109493358997,
+      "waypoints": 3
+    },
+    {
+      "level": "high",
+      "planner": "rrt_connect_fixed",
+      "seed": 2,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.03879583299567457,
+      "path_length_rad": 3.008638062314513,
+      "waypoints": 3
+    },
+    {
+      "level": "high",
+      "planner": "rrt_connect_fixed",
+      "seed": 3,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.04145970899844542,
+      "path_length_rad": 3.2018010481469155,
+      "waypoints": 3
+    },
+    {
+      "level": "high",
+      "planner": "rrt_connect_fixed",
+      "seed": 4,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.09851770800014492,
+      "path_length_rad": 3.001778313473224,
+      "waypoints": 4
+    },
+    {
+      "level": "high",
+      "planner": "rrt_connect_adaptive",
+      "seed": 0,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.21297529200091958,
+      "path_length_rad": 5.9203570555460265,
+      "waypoints": 9
+    },
+    {
+      "level": "high",
+      "planner": "rrt_connect_adaptive",
+      "seed": 1,
+      "timeout_s": 30.0,
+      "success": false,
+      "time_s": 30.0,
+      "reason": "timeout"
+    },
+    {
+      "level": "high",
+      "planner": "rrt_connect_adaptive",
+      "seed": 2,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.0801173750005546,
+      "path_length_rad": 2.7612161758612555,
+      "waypoints": 3
+    },
+    {
+      "level": "high",
+      "planner": "rrt_connect_adaptive",
+      "seed": 3,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.2718880000029458,
+      "path_length_rad": 3.797512148601614,
+      "waypoints": 3
+    },
+    {
+      "level": "high",
+      "planner": "rrt_connect_adaptive",
+      "seed": 4,
+      "timeout_s": 30.0,
+      "success": true,
+      "time_s": 0.33782512500329176,
+      "path_length_rad": 4.405516630496873,
+      "waypoints": 4
+    }
+  ],
+  "pipeline": [
+    {
+      "level": "low",
+      "deterministic_stages": true,
+      "seed": 0,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 1.419424916995922,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.05852945800143061,
+        "plan_grasp_primitive": 0.06548616699728882,
+        "plan_carry_escape": 0.14622820799559122,
+        "plan_drop_anchor_ik": 0.020464540997636504,
+        "plan_drop_preplace": 0.09249950000230456,
+        "plan_drop_rrt": 1.0272052090003854,
+        "plan_pregrasp_to_drop": 1.2921635000020615,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 1.4194028330020956
+      }
+    },
+    {
+      "level": "low",
+      "deterministic_stages": true,
+      "seed": 1,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 0.7753091670019785,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.04534770800091792,
+        "plan_grasp_primitive": 0.06196224999439437,
+        "plan_carry_escape": 0.16368991600029403,
+        "plan_drop_anchor_ik": 0.020939874993928242,
+        "plan_drop_preplace": 0.08938283300085459,
+        "plan_drop_rrt": 0.3820856249949429,
+        "plan_pregrasp_to_drop": 0.6644808330020169,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 0.775276833002863
+      }
+    },
+    {
+      "level": "low",
+      "deterministic_stages": true,
+      "seed": 2,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 0.8029821250020177,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.046206750004785135,
+        "plan_grasp_primitive": 0.06140445799974259,
+        "plan_carry_escape": 0.1451336249956512,
+        "plan_drop_anchor_ik": 0.020306542995967902,
+        "plan_drop_preplace": 0.08832841700495919,
+        "plan_drop_rrt": 0.43265512499783654,
+        "plan_pregrasp_to_drop": 0.692012583000178,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 0.80296104199806
+      }
+    },
+    {
+      "level": "low",
+      "deterministic_stages": false,
+      "seed": 0,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 0.6287460829989868,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.045011624999460764,
+        "plan_grasp_primitive": 0.016618957997707184,
+        "plan_carry_escape": 0.07074483299948042,
+        "plan_drop_anchor_ik": 0.020437916995433625,
+        "plan_drop_preplace": 2.082997525576502e-06,
+        "plan_drop_rrt": 0.46704845799831674,
+        "plan_pregrasp_to_drop": 0.563867000004393,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 0.6287291670014383
+      }
+    },
+    {
+      "level": "low",
+      "deterministic_stages": false,
+      "seed": 1,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 0.6789722500034259,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.0448885000005248,
+        "plan_grasp_primitive": 0.016464375003124587,
+        "plan_carry_escape": 0.07022312500339467,
+        "plan_drop_anchor_ik": 0.020110332014155574,
+        "plan_drop_preplace": 2.624998160172254e-06,
+        "plan_drop_rrt": 0.5184611250006128,
+        "plan_pregrasp_to_drop": 0.6144024160021218,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 0.6789569579996169
+      }
+    },
+    {
+      "level": "low",
+      "deterministic_stages": false,
+      "seed": 2,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 0.4722870000041439,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.04663641699880827,
+        "plan_grasp_primitive": 0.021942540995951276,
+        "plan_carry_escape": 0.07089104199985741,
+        "plan_drop_anchor_ik": 0.020444542002223898,
+        "plan_drop_preplace": 1.8330028979107738e-06,
+        "plan_drop_rrt": 0.30311449999862816,
+        "plan_pregrasp_to_drop": 0.400128291999863,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 0.47226566699828254
+      }
+    },
+    {
+      "level": "mid",
+      "deterministic_stages": true,
+      "seed": 0,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 0.8083820829997421,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.14148783299606293,
+        "plan_grasp_primitive": 0.05844179199630162,
+        "plan_carry_escape": 0.19958137499634176,
+        "plan_drop_anchor_ik": 0.020429458003491163,
+        "plan_drop_preplace": 0.14370104200497735,
+        "plan_drop_rrt": 0.2360657910030568,
+        "plan_pregrasp_to_drop": 0.6052776670039748,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 0.8083595420030179
+      }
+    },
+    {
+      "level": "mid",
+      "deterministic_stages": true,
+      "seed": 1,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 2.821423875000619,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.11801233300502645,
+        "plan_grasp_primitive": 0.06006741700548446,
+        "plan_carry_escape": 0.20256199999857927,
+        "plan_drop_anchor_ik": 0.020620290997612756,
+        "plan_drop_preplace": 0.1440960410036496,
+        "plan_drop_rrt": 2.267259833002754,
+        "plan_pregrasp_to_drop": 2.6401405409997096,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 2.821400540997274
+      }
+    },
+    {
+      "level": "mid",
+      "deterministic_stages": true,
+      "seed": 2,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 0.7887368750016321,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.1021490420025657,
+        "plan_grasp_primitive": 0.05890591700153891,
+        "plan_carry_escape": 0.1975197920037317,
+        "plan_drop_anchor_ik": 0.020471958996495232,
+        "plan_drop_preplace": 0.14373741599411005,
+        "plan_drop_rrt": 0.25708599999779835,
+        "plan_pregrasp_to_drop": 0.6245482090016594,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 0.7887140419989009
+      }
+    },
+    {
+      "level": "mid",
+      "deterministic_stages": false,
+      "seed": 0,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 26.785941957998148,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.14138100000127451,
+        "plan_grasp_primitive": 0.016211041998758446,
+        "plan_carry_escape": 0.009026125000673346,
+        "plan_drop_anchor_ik": 0.020401417001266964,
+        "plan_drop_preplace": 2.3750035325065255e-06,
+        "plan_drop_rrt": 26.589791499995044,
+        "plan_pregrasp_to_drop": 26.62492000000202,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 26.785919041998568
+      }
+    },
+    {
+      "level": "mid",
+      "deterministic_stages": false,
+      "seed": 1,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 40.059287875003065,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.11857004200282972,
+        "plan_grasp_primitive": 0.01609900000039488,
+        "plan_carry_escape": 0.009167874995910097,
+        "plan_drop_anchor_ik": 0.02030612299859058,
+        "plan_drop_preplace": 1.9170038285665214e-06,
+        "plan_drop_rrt": 39.885984791995725,
+        "plan_pregrasp_to_drop": 39.9212852089986,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 40.05926312500378
+      }
+    },
+    {
+      "level": "mid",
+      "deterministic_stages": false,
+      "seed": 2,
+      "timeout_s": 90.0,
+      "success": false,
+      "time_s": 54.124585249999654,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.10396791699895402,
+        "plan_grasp_primitive": 0.016490750000230037,
+        "plan_carry_escape": 0.009196541999699548,
+        "plan_total": 54.12456999999995
+      },
+      "error": "pregrasp_to_drop exceeded stage budget of 54.0s"
+    },
+    {
+      "level": "high",
+      "deterministic_stages": true,
+      "seed": 0,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 1.8769503330040607,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.9193659169977764,
+        "plan_grasp_primitive": 0.07980358300119406,
+        "plan_carry_escape": 0.2229501670008176,
+        "plan_drop_anchor_ik": 0.021978749995469116,
+        "plan_drop_preplace": 0.0865914169989992,
+        "plan_drop_rrt": 0.5375683340025716,
+        "plan_pregrasp_to_drop": 0.8747070840036031,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 1.87693125000078
+      }
+    },
+    {
+      "level": "high",
+      "deterministic_stages": true,
+      "seed": 1,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 1.0969825419961126,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.25077104099909775,
+        "plan_grasp_primitive": 0.07980508400214603,
+        "plan_carry_escape": 0.21726212499925168,
+        "plan_drop_anchor_ik": 0.020315958994615357,
+        "plan_drop_preplace": 0.08339416699891444,
+        "plan_drop_rrt": 0.43685837499651825,
+        "plan_pregrasp_to_drop": 0.7633634579979116,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 1.0969613330016728
+      }
+    },
+    {
+      "level": "high",
+      "deterministic_stages": true,
+      "seed": 2,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 1.1005167499970412,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.17003162499895552,
+        "plan_grasp_primitive": 0.07864124999468913,
+        "plan_carry_escape": 0.21877958299592137,
+        "plan_drop_anchor_ik": 0.020335876011813525,
+        "plan_drop_preplace": 0.08381862500391435,
+        "plan_drop_rrt": 0.5202460419968702,
+        "plan_pregrasp_to_drop": 0.8487713329959661,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 1.1004890830008662
+      }
+    },
+    {
+      "level": "high",
+      "deterministic_stages": false,
+      "seed": 0,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 10.578964500004076,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.921940333006205,
+        "plan_grasp_primitive": 0.030196249994332902,
+        "plan_carry_escape": 0.0031908340024529025,
+        "plan_drop_anchor_ik": 0.020070915983524173,
+        "plan_drop_preplace": 1.7499987734481692e-06,
+        "plan_drop_rrt": 9.594459082996764,
+        "plan_pregrasp_to_drop": 9.62353937500302,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 10.578947292000521
+      }
+    },
+    {
+      "level": "high",
+      "deterministic_stages": false,
+      "seed": 1,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 1.968177333001222,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.25217595899448497,
+        "plan_grasp_primitive": 0.030608458997448906,
+        "plan_carry_escape": 0.0033889170008478686,
+        "plan_drop_anchor_ik": 0.020241833008185495,
+        "plan_drop_preplace": 1.7080019460991025e-06,
+        "plan_drop_rrt": 1.6527162089987542,
+        "plan_pregrasp_to_drop": 1.6821193340001628,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 1.968162665994896
+      }
+    },
+    {
+      "level": "high",
+      "deterministic_stages": false,
+      "seed": 2,
+      "timeout_s": 90.0,
+      "success": true,
+      "time_s": 0.6940203749982174,
+      "timings_s": {
+        "plan_home_to_pregrasp": 0.1716295420046663,
+        "plan_grasp_primitive": 0.03045087500504451,
+        "plan_carry_escape": 0.0032937919968389906,
+        "plan_drop_anchor_ik": 0.020408500007761177,
+        "plan_drop_preplace": 1.6250050975941122e-06,
+        "plan_drop_rrt": 0.45922070799861103,
+        "plan_pregrasp_to_drop": 0.48876074999861885,
+        "drop_candidates_tried": 4.0,
+        "drop_feasible_candidates": 1.0,
+        "drop_rrt_calls": 1.0,
+        "plan_total": 0.6940054169972427
+      }
+    }
+  ]
+}

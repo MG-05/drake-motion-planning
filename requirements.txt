@@ -1,0 +1,3 @@
+drake>=1.51
+numpy>=2.0
+matplotlib>=3.10

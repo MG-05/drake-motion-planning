@@ -33,7 +33,7 @@ from drake import lcmt_iiwa_command, lcmt_schunk_wsg_command
 from pydrake.lcm import DrakeLcm
 
 from src.planning.collision import is_collision_free
-from src.manipulation.grasp import GraspOptions
+from src.manipulation.grasp import GraspOptions, GraspVariant
 from src.manipulation.manipulation_fsm import ManipulationFSM, ManipulationOptions
 from src.manipulation.pregrasp import get_floating_body, compute_pregrasp_pose_for_brick
 from src.planning.rrt_connect import RRTConnectConfig
@@ -153,6 +153,51 @@ def _hold_current_position(
         t = t_next
 
 
+def _compute_shelf_drop_pose(
+    sim_plant,
+    plant_context,
+    iiwa_instance,
+    brick_body,
+    target_brick_position_W,
+    approach_depth_m=0.10,
+    release_lift_m=0.015,
+):
+    """
+    Gripper pose that places the brick at a shelf position, mirroring the
+    pickup geometry: compute the pregrasp pose the brick would have at the
+    target location, then advance by the grasp approach depth (plus a small
+    lift so the brick is released just above the shelf surface).
+    """
+    X_WB_saved = sim_plant.GetFreeBodyPose(plant_context, brick_body)
+    sim_plant.SetFreeBodyPose(
+        plant_context,
+        brick_body,
+        RigidTransform(
+            X_WB_saved.rotation(),
+            np.asarray(target_brick_position_W, dtype=float).reshape(3),
+        ),
+    )
+    try:
+        X_WG_preplace = compute_pregrasp_pose_for_brick(
+            plant=sim_plant,
+            plant_context=plant_context,
+            iiwa_instance=iiwa_instance,
+            brick_body=brick_body,
+            fingertip_clearance_m=0.04,
+            wsg_body_to_fingertips_m=0.14,
+        )
+    finally:
+        sim_plant.SetFreeBodyPose(plant_context, brick_body, X_WB_saved)
+
+    approach_axis_W = X_WG_preplace.rotation().matrix()[:, 1]
+    p_WG_drop = (
+        X_WG_preplace.translation()
+        + float(approach_depth_m) * approach_axis_W
+        + np.array([0.0, 0.0, float(release_lift_m)])
+    )
+    return RigidTransform(X_WG_preplace.rotation(), p_WG_drop)
+
+
 def _compute_wsg_planning_configs(q_wsg_open):
     """
     Build open / near-closed WSG planning configs in plant position units.
@@ -183,6 +228,18 @@ def main():
         choices=tuple(shelf_level_to_brick_position.keys()),
         default="mid",
         help="Initial foam brick shelf height for planning benchmarks.",
+    )
+    parser.add_argument(
+        "--drop_location",
+        choices=("low", "mid", "high", "top"),
+        default="top",
+        help="Where to place the brick: inside a shelf level or on top of the shelf.",
+    )
+    parser.add_argument(
+        "--recording_out",
+        type=Path,
+        default=Path("rrt_connect.html"),
+        help="Path for the MeshCat static-HTML recording written after execution.",
     )
     parser.add_argument(
         "--plan_only",
@@ -380,8 +437,18 @@ def main():
     print("\n[Pregrasp] X_WG_pregrasp =", X_WG_pregrasp)
 
     # Drop target for place/release.
-    drop_position_W = np.array([0.0, 0.05, 0.78])
-    X_WG_drop = RigidTransform(X_WG_pregrasp.rotation(), drop_position_W)
+    if args.drop_location == "top":
+        drop_position_W = np.array([0.0, 0.05, 0.78])
+        X_WG_drop = RigidTransform(X_WG_pregrasp.rotation(), drop_position_W)
+    else:
+        X_WG_drop = _compute_shelf_drop_pose(
+            sim_plant=sim_plant,
+            plant_context=plant_context,
+            iiwa_instance=iiwa,
+            brick_body=brick_body,
+            target_brick_position_W=shelf_level_to_brick_position[args.drop_location],
+        )
+    print(f"[Drop] location={args.drop_location}, X_WG_drop translation =", X_WG_drop.translation())
 
     joints_lower_limits, joints_upper_limits = _compute_iiwa_joint_limits(sim_plant, iiwa)
     print(f"Is the start config collision free? {is_free(q_start)}")
@@ -401,6 +468,26 @@ def main():
         # Positive z lifts upward to reduce shelf scraping on retreat.
         retreat_offset_world_y_m=0.0,
         retreat_offset_world_z_m=0.02,
+        variants=(
+            # Centered grasps, tried first.
+            GraspVariant(approach_depth_m=0.10),
+            GraspVariant(approach_depth_m=0.095),
+            GraspVariant(approach_depth_m=0.105),
+            # Fallbacks for compartments with a low ceiling (e.g. the top
+            # shelf level): grip slightly above the brick centerline so the
+            # wrist stays clear of the shelf above, and retreat with extra
+            # lift since the brick then hangs lower relative to the gripper.
+            GraspVariant(
+                approach_depth_m=0.10,
+                vertical_offset_m=0.02,
+                retreat_extra_lift_m=0.02,
+            ),
+            GraspVariant(
+                approach_depth_m=0.105,
+                vertical_offset_m=0.02,
+                retreat_extra_lift_m=0.02,
+            ),
+        ),
     )
     max_planning_time_s = 600.0
     # Keep early stages on a shorter leash so pathological home->pregrasp
@@ -608,8 +695,7 @@ def main():
     if meshcat is not None:
         meshcat.StopRecording()
         meshcat.PublishRecording()
-        meshcat.StaticHtml()
-        with open("rrt_connect.html", "w") as f:
+        with open(args.recording_out, "w") as f:
             f.write(meshcat.StaticHtml())
 
     return 0

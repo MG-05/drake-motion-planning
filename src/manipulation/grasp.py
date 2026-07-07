@@ -22,6 +22,10 @@ class GraspVariant:
     lateral_offset_m: float = 0.0
     vertical_offset_m: float = 0.0
     yaw_offset_rad: float = 0.0
+    # Extra post-grasp retreat lift for this variant. Grasps taken above the
+    # payload centerline carry the payload lower relative to the gripper, so
+    # they need additional lift to preserve transport clearance.
+    retreat_extra_lift_m: float = 0.0
 
 
 @dc.dataclass(frozen=True)
@@ -122,10 +126,18 @@ def _plan_rrt_segment(
     )
 
 
-def _make_retreat_pose(X_WG_pregrasp: RigidTransform, options: GraspOptions) -> RigidTransform:
+def _make_retreat_pose(
+    X_WG_pregrasp: RigidTransform,
+    options: GraspOptions,
+    variant: GraspVariant,
+) -> RigidTransform:
     p_WG_pre = X_WG_pregrasp.translation()
     p_WG_retreat = p_WG_pre + np.array(
-        [0.0, float(options.retreat_offset_world_y_m), float(options.retreat_offset_world_z_m)]
+        [
+            0.0,
+            float(options.retreat_offset_world_y_m),
+            float(options.retreat_offset_world_z_m) + float(variant.retreat_extra_lift_m),
+        ]
     )
     return RigidTransform(X_WG_pregrasp.rotation(), p_WG_retreat)
 
@@ -292,7 +304,7 @@ def plan_grasp_primitive(
             if prepare_retreat_checker is not None:
                 prepare_retreat_checker(np.asarray(q_grasp, dtype=float).reshape(7))
 
-            X_WG_retreat = _make_retreat_pose(X_WG_pregrasp, options)
+            X_WG_retreat = _make_retreat_pose(X_WG_pregrasp, options, variant)
             q_retreat = solve_iiwa_ik_for_gripper_pose(
                 plant=plant,
                 root_context_current=root_context_current,

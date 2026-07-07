@@ -1,4 +1,0 @@
-Purpose of src/controller folder: execute trajectory in simulation. Will manage the low-level joint motion
-Need to add:
-1. trajectory_exec.py
-2. ik.py
